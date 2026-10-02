@@ -144,7 +144,6 @@ export const FEATURED_VIDEO = {
 
 export const GROUND_VIDEO = {
   src: "/belgrove-hero-golden-aerial.mp4",
-  caption: "Kabusa-Ketti · Aerial view · Sep 2026",
 };
 
 /** Real site photos only. Captions describe what is actually in the photo. */

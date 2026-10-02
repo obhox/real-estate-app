@@ -91,9 +91,6 @@ export default function Ground() {
               </span>
             </button>
           )}
-          <span className="absolute bottom-3 left-3 mono text-[10px] tracking-[0.06em] uppercase bg-black/55 text-white px-2.5 py-1 rounded-full pointer-events-none">
-            {GROUND_VIDEO.caption}
-          </span>
         </div>
       </figure>
       <VideoTile
