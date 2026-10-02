@@ -24,9 +24,12 @@ export async function GET() {
     });
   }
 
+  // Bell shows open + unread only: viewing (read) or finishing the work
+  // (resolved) clears the row from the list. Resolution of stale rows above
+  // keeps "action taken" clearing even items never opened.
   const [notifications, unreadCount] = await Promise.all([
     prisma.notification.findMany({
-      where: { userId: session!.user.id, resolvedAt: null },
+      where: { userId: session!.user.id, read: false, resolvedAt: null },
       orderBy: { createdAt: "desc" },
       take: 20,
       include: { booking: { select: { ref: true } } },

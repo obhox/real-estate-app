@@ -40,7 +40,7 @@ export default function NotificationBell() {
 
   async function markAllRead() {
     setUnreadCount(0);
-    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    setNotifications([]);
     await fetch("/api/admin/notifications", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -49,7 +49,7 @@ export default function NotificationBell() {
   }
 
   async function markRead(id: string) {
-    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
+    setNotifications((prev) => prev.filter((n) => n.id !== id));
     setUnreadCount((c) => Math.max(0, c - 1));
     await fetch("/api/admin/notifications", {
       method: "PATCH",
@@ -96,16 +96,14 @@ export default function NotificationBell() {
                 key={n.id}
                 href={n.bookingId ? `/admin/bookings/${n.bookingId}` : "/admin/bookings"}
                 onClick={() => {
-                  if (!n.read) markRead(n.id);
+                  markRead(n.id);
                   setOpen(false);
                 }}
-                className={`block px-4 py-3 text-sm border-b border-stone-50 last:border-0 hover:bg-stone-50 ${
-                  n.read ? "text-stone-500" : "text-stone-800 bg-stone-50/50"
-                }`}
+                className="block px-4 py-3 text-sm border-b border-stone-50 last:border-0 hover:bg-stone-50 text-stone-800 bg-stone-50/50"
               >
                 <div className="flex items-start gap-2">
-                  {!n.read && <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" />}
-                  <div className={n.read ? "" : "font-medium"}>
+                  <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" />
+                  <div className="font-medium">
                     {n.message}
                     <div className="text-xs text-stone-400 font-normal mt-0.5">
                       {new Date(n.createdAt).toLocaleString("en-US", {
