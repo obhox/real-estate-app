@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import AdminTopBar, { AdminSidebar } from "@/components/admin/AdminTopBar";
+import SessionGuard from "@/components/admin/SessionGuard";
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -26,11 +27,17 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   }, [navOpen]);
 
   if (isLogin) {
-    return <>{children}</>;
+    return (
+      <>
+        <SessionGuard />
+        {children}
+      </>
+    );
   }
 
   return (
     <div className="min-h-screen flex bg-[var(--ops-bg)]">
+      <SessionGuard />
       <AdminSidebar open={navOpen} onClose={() => setNavOpen(false)} />
       <div className="flex-1 min-w-0 flex flex-col">
         <AdminTopBar onOpenNav={() => setNavOpen(true)} />

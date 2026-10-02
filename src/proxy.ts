@@ -3,6 +3,21 @@ import { auth } from "@/auth";
 import { isInternalRole } from "@/lib/authz";
 import { checkRateLimit, clientIp, rateLimitResponse } from "@/lib/rate-limit";
 
+// Admin responses must never be cached (Back after sign-out must hit the
+// server guard, not a stored copy). next.config.ts declares the same headers
+// statically; this enforces them at runtime too, including on generated
+// pages and redirects, which static header rules do not override.
+const NO_STORE_HEADERS: Record<string, string> = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, private",
+  Pragma: "no-cache",
+  Expires: "0",
+};
+
+function noStore(res: NextResponse): NextResponse {
+  for (const [key, value] of Object.entries(NO_STORE_HEADERS)) res.headers.set(key, value);
+  return res;
+}
+
 export const proxy = auth((req) => {
   const pathname = req.nextUrl.pathname;
 
@@ -19,20 +34,20 @@ export const proxy = auth((req) => {
 
   if (isLoginPage) {
     if (isInternalUser) {
-      return NextResponse.redirect(new URL("/admin", req.url));
+      return noStore(NextResponse.redirect(new URL("/admin/bookings", req.url)));
     }
-    return NextResponse.next();
+    return noStore(NextResponse.next());
   }
 
   if (!isInternalUser) {
     if (isApiRoute) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return noStore(NextResponse.json({ error: "Unauthorized" }, { status: 401 }));
     }
     const loginUrl = new URL("/admin/login", req.url);
-    return NextResponse.redirect(loginUrl);
+    return noStore(NextResponse.redirect(loginUrl));
   }
 
-  return NextResponse.next();
+  return noStore(NextResponse.next());
 });
 
 export const config = {

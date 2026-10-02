@@ -21,6 +21,25 @@ function TopBarInner({ onOpenNav }: { onOpenNav?: () => void }) {
   const userName = "Admin";
   const userRole = "Operations";
   const initials = userName.split(" ").map((s: string) => s[0]).join("").slice(0, 2).toUpperCase();
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  // Hard sign-out: await the cookie clear, then replace the location so the
+  // Next router cache and all in-memory admin data are discarded (Back can
+  // never restore this tab's admin UI). Failures keep the user on the page
+  // with an inline error instead of silently navigating away still signed in.
+  async function handleSignOut() {
+    if (signingOut) return;
+    setSigningOut(true);
+    setSignOutError(null);
+    try {
+      await signOut({ redirect: false });
+      window.location.replace("/admin/login");
+    } catch {
+      setSignOutError("Sign out failed. Please try again.");
+      setSigningOut(false);
+    }
+  }
 
   function onSearch(e: React.FormEvent) {
     e.preventDefault();
@@ -80,11 +99,17 @@ function TopBarInner({ onOpenNav }: { onOpenNav?: () => void }) {
             <div className="text-[13px] font-medium text-[var(--ops-text)] leading-none">{userName}</div>
             <div className="text-[11px] tracking-wide uppercase text-[var(--ops-muted)] capitalize">{userRole}</div>
           </div>
+          {signOutError && (
+            <span role="alert" className="hidden lg:inline text-[11px] text-red-600">
+              {signOutError}
+            </span>
+          )}
           <button
-            onClick={() => signOut({ callbackUrl: "/admin/login" })}
-            className="hidden lg:inline-flex items-center gap-1.5 text-[12px] text-[var(--ops-muted)] hover:text-[var(--ops-text)] border border-[var(--ops-border)] rounded-full px-3 py-1.5 bg-white hover:bg-[var(--ops-bg)] transition-colors ml-1"
+            onClick={handleSignOut}
+            disabled={signingOut}
+            className="hidden lg:inline-flex items-center gap-1.5 text-[12px] text-[var(--ops-muted)] hover:text-[var(--ops-text)] border border-[var(--ops-border)] rounded-full px-3 py-1.5 bg-white hover:bg-[var(--ops-bg)] transition-colors ml-1 disabled:opacity-50 disabled:cursor-wait"
           >
-            <span>Sign out</span>
+            <span>{signingOut ? "Signing out…" : "Sign out"}</span>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
           </button>
         </div>
