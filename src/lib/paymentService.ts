@@ -98,7 +98,7 @@ export async function recordPaymentAndGenerateReceipt(params: {
     receiptId: confirmed.receiptId,
     ref: receiptRef,
     render: async () => {
-      const { buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } = await import("@/lib/receipt-amounts");
+      const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
       const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
       const fullTxn = await prisma.transaction.findUnique({
         where: { id: transaction.id },
@@ -133,6 +133,12 @@ export async function recordPaymentAndGenerateReceipt(params: {
               ? "Initial payment"
               : `Month ${confirmed.installment.installmentNumber} payment`
             : undefined;
+      const settlement = settlementCopy({
+        balanceAfter: confirmed.newOutstanding,
+        settledOn: confirmed.payment.paymentDate,
+        scheduledEnd: transaction.installments[transaction.installments.length - 1]?.dueDate ?? null,
+        formatDate: formatDateDMY,
+      });
       return generateReceiptPdf({
         ref: receiptRef,
         issuedDate: issuedDateStr,
@@ -149,7 +155,8 @@ export async function recordPaymentAndGenerateReceipt(params: {
         payments: [{ date: issuedDateStr, method: params.paymentMethod ?? "Bank Transfer", amount: params.amount }],
         history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
         accountRef: buildAccountRef(transaction.ref, bookingRow?.ref ?? null),
-        label: settlementLabel(confirmed.newOutstanding),
+        label: settlement.headline,
+        settlementNote: settlement.note,
         paymentDate: issuedDateStr,
         paymentMethodLabel: params.paymentMethod ?? "Bank Transfer",
         bankReference: saved?.bankReference ?? null,

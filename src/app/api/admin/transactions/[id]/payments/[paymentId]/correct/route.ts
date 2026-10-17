@@ -231,7 +231,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   }
   const txn = replacement.transaction;
   const issuedDateStr = formatDateDMY(replacement.paymentDate);
-  const { buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } = await import("@/lib/receipt-amounts");
+  const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
   const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
   const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
     prisma.payment.findMany({ where: { transactionId: txn.id, status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } }),
@@ -264,6 +264,12 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
           ? "Initial payment"
           : `Month ${replacement.installment.installmentNumber} payment`
         : undefined;
+  const settlement = settlementCopy({
+    balanceAfter: txn.totalPayable - confirmedTotal,
+    settledOn: replacement.paymentDate,
+    scheduledEnd: txn.installments[txn.installments.length - 1]?.dueDate ?? null,
+    formatDate: formatDateDMY,
+  });
   const pdfOutcome = await generateAndStoreReceiptPdf({
     db: prisma,
     receiptId,
@@ -286,7 +292,8 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
         history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
         accountRef: buildAccountRef(txn.ref, bookingRow?.ref ?? null),
         replacesRef: originalReceiptRef,
-        label: settlementLabel(txn.totalPayable - confirmedTotal),
+        label: settlement.headline,
+        settlementNote: settlement.note,
         paymentDate: issuedDateStr,
         paymentMethodLabel: replacement.paymentMethod ?? "Bank Transfer",
         bankReference: replacement.bankReference ?? null,

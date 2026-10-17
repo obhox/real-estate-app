@@ -114,7 +114,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
 
   // Full receipt content: every confirmed payment with receipt refs and
   // running balances, the account reference line, and the settlement label.
-  const { buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } = await import("@/lib/receipt-amounts");
+  const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
   const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
   const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
     prisma.payment.findMany({
@@ -152,6 +152,12 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   // Generate the PDF once here and store the bytes on the receipt row.
   // Sends and downloads reuse these stored bytes; only an explicit
   // "Regenerate & resend" rebuilds them.
+  const settlement = settlementCopy({
+    balanceAfter: confirmed.newOutstanding,
+    settledOn: confirmed.payment.paymentDate,
+    scheduledEnd: txn.installments[txn.installments.length - 1]?.dueDate ?? null,
+    formatDate: formatDateDMY,
+  });
   const pdfOutcome = await generateAndStoreReceiptPdf({
     db: prisma,
     receiptId: confirmed.receiptId,
@@ -179,7 +185,8 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
         ],
         history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
         accountRef: buildAccountRef(txn.ref, bookingRow?.ref ?? null),
-        label: settlementLabel(confirmed.newOutstanding),
+        label: settlement.headline,
+        settlementNote: settlement.note,
         paymentDate: issuedDateStr,
         paymentMethodLabel: confirmed.payment.paymentMethod ?? "Bank Transfer",
         bankReference: preview.bankReference ?? null,

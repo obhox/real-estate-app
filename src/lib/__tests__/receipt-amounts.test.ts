@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { receiptAmountsRows, settlementLabel, buildReceiptHistory, appliedToLabel, installmentAppliedLabel } from "../receipt-amounts";
+import { receiptAmountsRows, settlementLabel, settlementCopy, settlementLetter, monthsAhead, buildReceiptHistory, appliedToLabel, installmentAppliedLabel } from "../receipt-amounts";
 
 describe("receiptAmountsRows", () => {
   const base = {
@@ -32,6 +32,17 @@ describe("receiptAmountsRows", () => {
     const rows = receiptAmountsRows({ ...base, installmentLabel: null });
     expect(rows.map((r) => r.key)).toEqual(["this-payment", "total-price", "paid-to-date", "balance"]);
   });
+
+  it("shows Interest directly under Total price when > 0 (TXN-2026-19362)", () => {
+    const rows = receiptAmountsRows({ ...base, interestAmount: 375_000 });
+    expect(rows.map((r) => r.key)).toEqual(["this-payment", "installment", "total-price", "interest", "paid-to-date", "balance"]);
+    expect(rows.find((r) => r.key === "interest")?.value).toBe(375_000);
+  });
+
+  it("omits Interest when zero or absent", () => {
+    expect(receiptAmountsRows({ ...base, interestAmount: 0 }).some((r) => r.key === "interest")).toBe(false);
+    expect(receiptAmountsRows(base).some((r) => r.key === "interest")).toBe(false);
+  });
 });
 
 describe("settlementLabel", () => {
@@ -40,6 +51,78 @@ describe("settlementLabel", () => {
     expect(settlementLabel(1)).toBe("PART PAYMENT");
     expect(settlementLabel(0)).toBe("FINAL PAYMENT, ACCOUNT SETTLED");
     expect(settlementLabel(-1_000_000)).toBe("FINAL PAYMENT, ACCOUNT SETTLED");
+  });
+});
+
+describe("settlementCopy", () => {
+  const fmt = (d: Date | string) => {
+    const x = new Date(d);
+    return `${String(x.getDate()).padStart(2, "0")}-${String(x.getMonth() + 1).padStart(2, "0")}-${x.getFullYear()}`;
+  };
+
+  it("part-payment copy carries no settlement note", () => {
+    const copy = settlementCopy({ balanceAfter: 656_250, settledOn: new Date(2026, 9, 16), formatDate: fmt });
+    expect(copy.settled).toBe(false);
+    expect(copy.headline).toBe("PART PAYMENT");
+    expect(copy.note).toBeNull();
+  });
+
+  it("early settlement states the date and months ahead", () => {
+    // Paid 16 Oct 2026, plan ran to 14 Feb 2027 → 4 months ahead.
+    const copy = settlementCopy({
+      balanceAfter: 0,
+      settledOn: new Date(2026, 9, 16),
+      scheduledEnd: new Date(2027, 1, 14),
+      formatDate: fmt,
+    });
+    expect(copy.settled).toBe(true);
+    expect(copy.headline).toBe("FINAL PAYMENT, ACCOUNT SETTLED");
+    expect(copy.monthsAhead).toBe(4);
+    expect(copy.note).toBe("Plan fully paid on 16-10-2026. 4 months ahead of schedule. No further payments due.");
+  });
+
+  it("settlement at/after the scheduled end omits the 'months ahead' clause", () => {
+    const copy = settlementCopy({
+      balanceAfter: 0,
+      settledOn: new Date(2027, 2, 1),
+      scheduledEnd: new Date(2027, 1, 14),
+      formatDate: fmt,
+    });
+    expect(copy.monthsAhead).toBeNull();
+    expect(copy.note).toBe("Plan fully paid on 01-03-2027. No further payments due.");
+  });
+});
+
+describe("monthsAhead", () => {
+  it("counts whole calendar months, floored at zero", () => {
+    expect(monthsAhead(new Date(2026, 9, 16), new Date(2027, 1, 14))).toBe(4);
+    expect(monthsAhead(new Date(2027, 1, 14), new Date(2027, 1, 14))).toBe(0);
+    expect(monthsAhead(new Date(2027, 2, 1), new Date(2027, 1, 14))).toBe(0);
+  });
+});
+
+describe("settlementLetter", () => {
+  const ctx = {
+    clientName: "Ada Okafor",
+    transactionRef: "TXN-2026-19362",
+    totalPaid: 7_875_000,
+    settledOn: new Date(2026, 9, 16),
+    formatDate: (d: Date | string) => String(d),
+    formatMoney: (n: number) => `₦${n.toLocaleString("en-NG")}`,
+  };
+
+  it("returns null while the account is not settled", () => {
+    const part = settlementCopy({ balanceAfter: 656_250 });
+    expect(settlementLetter(part, ctx)).toBeNull();
+  });
+
+  it("writes a settlement letter for a fully-paid plan", () => {
+    const settled = settlementCopy({ balanceAfter: 0, settledOn: new Date(2026, 9, 16) });
+    const letter = settlementLetter(settled, ctx);
+    expect(letter).toContain("Dear Ada Okafor,");
+    expect(letter).toContain("TXN-2026-19362");
+    expect(letter).toContain("₦7,875,000");
+    expect(letter).toContain("No further payments due.");
   });
 });
 

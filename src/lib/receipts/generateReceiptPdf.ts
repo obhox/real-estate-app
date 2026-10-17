@@ -61,6 +61,10 @@ export type ReceiptData = {
   outstandingBalance?: number;
   transactionRef?: string;
   installmentLabel?: string;
+  // Client-facing settlement sentence shown when the plan is fully paid
+  // (from settlementCopy) — e.g. "Plan fully paid on 14 Mar 2027, 2 months
+  // ahead of schedule. No further payments due."
+  settlementNote?: string | null;
 };
 
 function drawPersonIcon(doc: jsPDF, x: number, y: number, size: number) {
@@ -176,9 +180,14 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
   // Extend ReceiptData to carry unitPrice/plotQuantity if available (fallback to data)
   const unitPriceVal = (data as any).unitPrice ?? data.soldPrice;
   const plotQtyVal = (data as any).plotQuantity ?? 1;
-  const amountDueVal = unitPriceVal * plotQtyVal;
+  const interestVal = data.interestAmount ?? 0;
+  const subtotalVal = unitPriceVal * plotQtyVal;
+  // Amount Due is the full payable for the plot: subtotal + one-time interest,
+  // so the table reconciles with the "Total price" line (7,500,000 + 375,000).
+  const amountDueVal = subtotalVal + interestVal;
   const propTableX = margin;
   const propColW = [(W - margin * 2) * 0.42, (W - margin * 2) * 0.22, (W - margin * 2) * 0.14, (W - margin * 2) * 0.22];
+  const propRightX = propTableX + W - margin * 2 - 2;
   doc.setFillColor(22, 40, 31);
   doc.rect(propTableX, y, W - margin * 2, 7, "F");
   doc.setTextColor(212, 179, 104);
@@ -188,16 +197,17 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
   let pcx = propTableX + 2;
   for (let i = 0; i < propHeaders.length; i++) {
     const align = i >= 1 ? "right" : "left";
-    const tx = i === 0 ? pcx : i === 3 ? propTableX + W - margin * 2 - 2 : propTableX + propColW.slice(0, i).reduce((a, b) => a + b, 0) + 2;
+    const tx = i === 0 ? pcx : i === 3 ? propRightX : propTableX + propColW.slice(0, i).reduce((a, b) => a + b, 0) + 2;
     // For Unit Price, Plot Qty, Amount Due we right-align
     const isRight = i > 0;
-    doc.text(propHeaders[i], isRight ? (i === 3 ? propTableX + W - margin * 2 - 2 : propTableX + propColW.slice(0, i).reduce((a, b) => a + b, 0) + propColW[i] - 2) : pcx, y + 4.5, { align: isRight ? "right" : "left" });
+    doc.text(propHeaders[i], isRight ? (i === 3 ? propRightX : propTableX + propColW.slice(0, i).reduce((a, b) => a + b, 0) + propColW[i] - 2) : pcx, y + 4.5, { align: isRight ? "right" : "left" });
   }
   y += 7;
+  const propRowH = interestVal > 0 ? 12 : 7;
   doc.setFillColor(247, 242, 231);
-  doc.rect(propTableX, y, W - margin * 2, 7, "F");
+  doc.rect(propTableX, y, W - margin * 2, propRowH, "F");
   doc.setDrawColor(228, 220, 199);
-  doc.rect(propTableX, y, W - margin * 2, 7, "S");
+  doc.rect(propTableX, y, W - margin * 2, propRowH, "S");
   doc.setTextColor(22, 40, 31);
   doc.setFont(fontName, "normal");
   doc.setFontSize(7);
@@ -205,16 +215,24 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
   let pvx = propTableX;
   for (let i = 0; i < propColW.length - 1; i++) {
     pvx += propColW[i];
-    doc.line(pvx, y, pvx, y + 7);
+    doc.line(pvx, y, pvx, y + propRowH);
   }
-  // Fixed 7mm row: truncate as an explicit last resort, with an ellipsis so
+  // Fixed row: truncate as an explicit last resort, with an ellipsis so
   // the cut is visible rather than silently clipped by the cell border.
   const estateCell = data.estateName.length > 32 ? `${data.estateName.substring(0, 31)}…` : data.estateName;
   doc.text(estateCell, propTableX + 2, y + 4.5);
   doc.text(formatNaira(unitPriceVal), propTableX + propColW[0] + propColW[1] - 2, y + 4.5, { align: "right" });
   doc.text(String(plotQtyVal), propTableX + propColW[0] + propColW[1] + propColW[2] - 2, y + 4.5, { align: "right" });
-  doc.text(formatNaira(amountDueVal), propTableX + W - margin * 2 - 2, y + 4.5, { align: "right" });
-  y += 12;
+  doc.text(formatNaira(amountDueVal), propRightX, y + 4.5, { align: "right" });
+  if (interestVal > 0) {
+    // One-time plan interest, shown inside the table so the figures reconcile.
+    doc.setDrawColor(228, 220, 199);
+    doc.line(propTableX, y + 7, propTableX + W - margin * 2, y + 7);
+    doc.setTextColor(80, 80, 80);
+    doc.text("Interest", propTableX + 2, y + 10.5);
+    doc.text(formatNaira(interestVal), propRightX, y + 10.5, { align: "right" });
+  }
+  y += propRowH + 5;
 
   // Payment Details section (spec 14) — show plan, interest, totals if available via extended data
   const ext: any = data as any;
@@ -229,12 +247,13 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
     doc.setTextColor(80, 80, 80);
     const details: [string, string][] = [];
     // Same amounts layout and wording as the admin receipt page and the
-    // client receipt (This payment → Installment → Total price →
+    // client receipt (This payment → Installment → Total price → Interest →
     // Paid to date → Balance remaining, Discount only when > 0).
     for (const row of receiptAmountsRows({
       thisPayment: data.amountPaid,
       installmentLabel: ext.installmentLabel ?? null,
       totalPrice: ext.totalPayable ?? data.soldPrice,
+      interestAmount: ext.interestAmount ?? null,
       paidToDate: ext.totalPaidAfter ?? data.amountPaid,
       balanceRemaining: ext.outstandingBalance ?? data.soldPrice - data.amountPaid,
       discount: data.discount ?? 0,
@@ -242,7 +261,6 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
       details.push([`${row.label}:`, typeof row.value === "number" ? formatNaira(row.value) : row.value]);
     }
     if (ext.paymentPlanName) details.push(["Payment Plan:", ext.paymentPlanName]);
-    if (ext.interestAmount !== undefined) details.push(["Interest:", formatNaira(ext.interestAmount)]);
     if (ext.previouslyPaid !== undefined) details.push(["Previously Paid:", formatNaira(ext.previouslyPaid)]);
     if (data.paymentDate) details.push(["Payment Date:", data.paymentDate]);
     if (data.paymentMethodLabel) details.push(["Method:", data.paymentMethodLabel]);
@@ -257,6 +275,17 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
       y += 3.5 * valLines.length;
     }
     y += 2;
+  }
+
+  // Settlement sentence (only when the plan is fully paid): client-facing,
+  // derived from settlementCopy — never a staff-only note.
+  if (ext.settlementNote) {
+    doc.setFont(fontName, "bold");
+    doc.setFontSize(7);
+    doc.setTextColor(22, 40, 31);
+    const noteLines = doc.splitTextToSize(ext.settlementNote, W - margin * 2);
+    doc.text(noteLines, margin, y);
+    y += 3.5 * noteLines.length + 3;
   }
 
   // Payment history table: every confirmed payment up to and including this

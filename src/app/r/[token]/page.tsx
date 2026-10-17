@@ -2,7 +2,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { formatNaira } from "@/lib/currency";
 import { formatDisplayName } from "@/lib/formatName";
-import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } from "@/lib/receipt-amounts";
+import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
 import { getAllocationLabelParts } from "@/lib/finance/ledger";
 import { isTokenUsable } from "@/lib/receipt-access";
 import { formatDateDMY } from "@/lib/time";
@@ -32,6 +32,7 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
           totalPayable: true,
           unitPrice: true,
           plotQuantity: true,
+          interestAmount: true,
           booking: { select: { ref: true } },
           payments: { where: { status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } },
           receipts: { select: { paymentId: true, ref: true } },
@@ -72,7 +73,12 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
   const previouslyPaid = history.filter((h) => !h.isCurrent).reduce((s, h) => s + h.amount, 0);
   const paidToDate = previouslyPaid + receipt.finalAmount;
   const balanceAfter = totalPrice - paidToDate;
-  const label = settlementLabel(balanceAfter);
+  const settlement = settlementCopy({
+    balanceAfter,
+    settledOn: receipt.payment?.paymentDate ?? receipt.issuedAt,
+    formatDate: formatDateDMY,
+  });
+  const label = settlement.headline;
   const accountRef = receipt.transaction ? buildAccountRef(receipt.transaction.ref, receipt.transaction.booking?.ref ?? null) : null;
   const plotQty = receipt.plotQuantity ?? receipt.transaction?.plotQuantity ?? null;
 
@@ -112,6 +118,7 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
             <div>
               <h1 className="fraunces text-[24px] sm:text-[28px] font-bold text-[#16281F]">RECEIPT</h1>
               <div className="mono text-[11px] tracking-[0.12em] text-[#8B6B4E] mt-1">{label}</div>
+              {settlement.note && <div className="public text-[12px] text-[#16281F] mt-2">{settlement.note}</div>}
             </div>
             <div className="text-left sm:text-right mono text-[11px] text-[#6B6656] break-words">
               <div className="break-all">RECEIPT: {receipt.ref}</div>
@@ -132,6 +139,7 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
                 thisPayment: receipt.finalAmount,
                 installmentLabel,
                 totalPrice,
+                interestAmount: receipt.transaction?.interestAmount ?? null,
                 paidToDate,
                 balanceRemaining: balanceAfter,
                 discount: receipt.discount,

@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { generateReceiptPdf } from "@/lib/receipts/generateReceiptPdf";
 import { generateQrDataUrl } from "@/lib/receipts/qr";
 import { getReceiptAccessUrl } from "@/lib/app-url";
-import { buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } from "@/lib/receipt-amounts";
+import { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
 import { getAllocationLabelParts } from "@/lib/finance/ledger";
 import { formatDateDMY } from "@/lib/time";
 
@@ -93,6 +93,11 @@ export async function renderReceiptPdfBuffer(receiptId: string, opts?: { force?:
     .filter((h) => !h.isCurrent)
     .reduce((s, h) => s + h.amount, 0);
   const balanceAfter = totalPayable - previouslyPaid - receipt.finalAmount;
+  const settlement = settlementCopy({
+    balanceAfter,
+    settledOn: receipt.payment?.paymentDate ?? receipt.issuedAt,
+    formatDate: formatDateDMY,
+  });
   // Allocation-derived label (see receipt-amounts); pre-backfill rows without
   // allocation rows keep the old installment-link label.
   const allocParts = await getAllocationLabelParts(prisma, receipt.payment.id).catch(() => []);
@@ -114,7 +119,8 @@ export async function renderReceiptPdfBuffer(receiptId: string, opts?: { force?:
     history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
     accountRef: receipt.transaction ? buildAccountRef(receipt.transaction.ref, receipt.transaction.booking?.ref ?? null) : undefined,
     replacesRef,
-    label: settlementLabel(balanceAfter),
+    label: settlement.headline,
+    settlementNote: settlement.note,
     paymentDate: formatDateDMY(receipt.payment?.paymentDate ?? receipt.issuedAt),
     paymentMethodLabel: receipt.paymentMethod ?? receipt.payment?.paymentMethod ?? "Bank Transfer",
     bankReference: receipt.payment?.bankReference ?? null,

@@ -8,7 +8,7 @@ import { prisma } from "@/lib/prisma";
 import { formatNaira } from "@/lib/currency";
 import { formatDisplayName } from "@/lib/formatName";
 import { formatDateTime } from "@/lib/booking-ui";
-import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementLabel, appliedToLabel } from "@/lib/receipt-amounts";
+import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
 import ActivitySection from "@/components/admin/ActivitySection";
 export const dynamic = "force-dynamic";
 import ReceiptActions from "./ReceiptActions";
@@ -28,7 +28,7 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
       transaction: {
         select: {
           id: true, ref: true, bookingId: true, manualReason: true, totalPayable: true,
-          unitPrice: true, plotQuantity: true,
+          unitPrice: true, plotQuantity: true, interestAmount: true,
           booking: { select: { id: true, ref: true } },
           payments: { where: { status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } },
           receipts: { select: { paymentId: true, ref: true } },
@@ -66,7 +66,12 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
   const previouslyPaid = history.filter((h) => !h.isCurrent).reduce((s, h) => s + h.amount, 0);
   const paidToDate = previouslyPaid + receipt.finalAmount;
   const balanceRemaining = totalPrice - paidToDate;
-  const label = settlementLabel(balanceRemaining);
+  const settlement = settlementCopy({
+    balanceAfter: balanceRemaining,
+    settledOn: receipt.payment?.paymentDate ?? receipt.issuedAt,
+    formatDate: (d) => formatDateTime(new Date(d)),
+  });
+  const label = settlement.headline;
   const accountRef = receipt.transaction ? buildAccountRef(receipt.transaction.ref, receipt.transaction.booking?.ref ?? null) : null;
   // Allocation-derived "Applied to" (waterfall rows), never the payment's
   // single installment link — a payment can span installments, which is why
@@ -102,6 +107,9 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
                 <span className="inline-flex px-3 py-1.5 rounded-full text-xs font-medium border bg-white border-[var(--ops-border)] text-[var(--ops-text)]">{label}</span>
                 {receipt.voidedAt && <span className="inline-flex px-3 py-1.5 rounded-full text-xs font-medium border bg-red-700 text-white border-red-700">VOID</span>}
               </div>
+              {settlement.note && (
+                <div className="mt-3 public text-[13px] text-[var(--ops-text)]">{settlement.note}</div>
+              )}
               {receipt.voidedAt && (
                 <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
                   Voided {formatDateTime(receipt.voidedAt)} — superseded, kept as evidence.
@@ -130,6 +138,7 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
                   thisPayment: receipt.finalAmount,
                   installmentLabel,
                   totalPrice: receipt.transaction?.totalPayable ?? receipt.amountBeforeDiscount,
+                  interestAmount: receipt.transaction?.interestAmount ?? null,
                   paidToDate,
                   balanceRemaining,
                   discount: receipt.discount,
