@@ -3,6 +3,7 @@ import { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { formatNaira } from "@/lib/currency";
 import { previewAllocation } from "@/lib/finance/ledger";
+import { validatePayment, PAYMENT_METHODS } from "@/lib/paymentValidation";
 
 type Installment = { id: string; installmentNumber: number; type: string; dueDate: string; scheduledAmount: number; paidAmount: number; status: string };
 
@@ -11,16 +12,18 @@ const LAST_METHOD_KEY = "belgrove-last-payment-method";
 const labelOf = (inst: Installment) => (inst.type === "INITIAL" ? "Initial payment" : `Month ${inst.installmentNumber}`);
 
 // Free-amount record form: the schedule is a guide, never a gate. The admin
-// types whatever the client actually paid; the suggested next amount is a
-// hint only and a live preview shows exactly what confirming will do. The
-// ONLY block is the total balance: amounts above the outstanding balance are
-// rejected (same rule the server enforces at record and confirm time).
+// types whatever the client actually paid; a live preview shows exactly what
+// confirming will do. Validation is the SHARED rule set (src/lib/paymentValidation)
+// — the same one the server runs, so the two can never drift. Hard blocks stop
+// the record; warnings (spill / shortfall) need an explicit acknowledgement.
 export default function RecordPaymentForm({
   transactionId,
   installments,
   outstanding,
   totalPaid,
   totalPayable,
+  contractDate,
+  existingReferences,
   onDone,
 }: {
   transactionId: string;
@@ -28,6 +31,8 @@ export default function RecordPaymentForm({
   outstanding: number;
   totalPaid: number;
   totalPayable: number;
+  contractDate?: string | null;
+  existingReferences?: string[];
   onDone?: () => void;
 }) {
   const router = useRouter();
@@ -49,16 +54,36 @@ export default function RecordPaymentForm({
   });
   const [bankReference, setBankReference] = useState("");
   const [notes, setNotes] = useState("");
+  const [reviewed, setReviewed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [serverWarnings, setServerWarnings] = useState<string[]>([]);
   const [success, setSuccess] = useState<string | null>(null);
 
   const amountNum = parseInt(amount.replace(/[^0-9]/g, ""), 10) || 0;
-  const overBy = amountNum - outstanding;
-  const isOver = amountNum > 0 && overBy > 0;
+
+  // Everything the shared rule set needs, recomputed as the form changes.
+  const validation = useMemo(
+    () =>
+      validatePayment({
+        amount: amountNum,
+        paymentDate: paymentDate ? new Date(paymentDate) : new Date(NaN),
+        paymentMethod,
+        bankReference,
+        contractDate: contractDate ? new Date(contractDate) : null,
+        totalPayable,
+        outstandingBalance: outstanding,
+        dueNow: suggestedDue,
+        existingReferences,
+        allocationReviewed: reviewed,
+      }),
+    [amountNum, paymentDate, paymentMethod, bankReference, contractDate, totalPayable, outstanding, suggestedDue, existingReferences, reviewed]
+  );
+  const blocked = validation.errors.length > 0;
+  const warnings = validation.warnings.map((w) => w.message);
 
   const preview = useMemo(() => {
-    if (amountNum <= 0) return null;
+    if (amountNum <= 0 || blocked) return null;
     try {
       return previewAllocation(
         ordered.map((i) => ({ id: i.id, installmentNumber: i.installmentNumber, scheduledAmount: i.scheduledAmount, paidAmount: i.paidAmount ?? 0, label: labelOf(i) })),
@@ -69,31 +94,51 @@ export default function RecordPaymentForm({
     } catch {
       return null;
     }
-  }, [amountNum, ordered, totalPayable, totalPaid]);
+  }, [amountNum, blocked, ordered, totalPayable, totalPaid]);
+
+  // Changing any field invalidates a prior acknowledgement.
+  const resetAck = () => {
+    setReviewed(false);
+    setServerWarnings([]);
+  };
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (amountNum <= 0) {
-      setError("Enter a valid amount");
+    if (blocked) {
+      setError(validation.errors[0].message);
       return;
     }
-    if (isOver) {
-      setError(
-        `Amount exceeds the outstanding balance by ${formatNaira(overBy)}. Reduce the amount — payments above the outstanding balance are rejected.`
-      );
+    if (validation.requiresAcknowledgement) {
+      setServerWarnings(warnings);
+      setError(null);
       return;
     }
     setBusy(true);
     setError(null);
+    setServerWarnings([]);
     setSuccess(null);
     try {
       const res = await fetch(`/api/admin/transactions/${transactionId}/payments`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: amountNum, paymentDate, paymentMethod, bankReference: bankReference.trim() || undefined, notes, idempotencyKey: idemKey }),
+        body: JSON.stringify({
+          amount: amountNum,
+          paymentDate,
+          paymentMethod,
+          bankReference: bankReference.trim() || undefined,
+          notes,
+          idempotencyKey: idemKey,
+          allocationReviewed: reviewed,
+        }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error ?? "Failed to record payment");
+      if (!res.ok) {
+        if (data.needsAllocationReview && Array.isArray(data.warnings)) {
+          setServerWarnings(data.warnings.map((w: { message: string }) => w.message));
+          throw new Error("Tick “I've reviewed the allocation” to confirm this payment.");
+        }
+        throw new Error(data.error ?? "Failed to record payment");
+      }
       try {
         localStorage.setItem(LAST_METHOD_KEY, paymentMethod);
       } catch {
@@ -107,6 +152,7 @@ export default function RecordPaymentForm({
       setAmount("");
       setNotes("");
       setBankReference("");
+      setReviewed(false);
       setIdemKey(crypto.randomUUID());
       router.refresh();
       if (onDone) setTimeout(onDone, 1200);
@@ -117,6 +163,9 @@ export default function RecordPaymentForm({
       setBusy(false);
     }
   }
+
+  const showWarnings = warnings.length > 0 || serverWarnings.length > 0;
+  const warningList = serverWarnings.length > 0 ? serverWarnings : warnings;
 
   return (
     <div className="mt-6 border-t border-[var(--ops-border)] pt-6">
@@ -131,11 +180,11 @@ export default function RecordPaymentForm({
         <div className="grid md:grid-cols-2 gap-3">
           <div>
             <label className="mono text-[11px] text-[var(--ops-muted)]">Amount received (₦) *</label>
-            <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={suggestedDue ? String(suggestedDue) : "e.g. 2905000"} inputMode="numeric" className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
+            <input value={amount} onChange={(e) => { setAmount(e.target.value); resetAck(); }} placeholder={suggestedDue ? String(suggestedDue) : "e.g. 2905000"} inputMode="numeric" className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
           </div>
           <div>
             <label className="mono text-[11px] text-[var(--ops-muted)]">Payment date *</label>
-            <input type="date" value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)} className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
+            <input type="date" value={paymentDate} onChange={(e) => { setPaymentDate(e.target.value); resetAck(); }} className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
           </div>
         </div>
         {preview && preview.lines.length > 0 && (
@@ -151,19 +200,32 @@ export default function RecordPaymentForm({
             <div className="mono text-[11px] text-[var(--ops-muted)] mt-1">Balance after: {formatNaira(preview.balanceAfter)}</div>
           </div>
         )}
-        {isOver && (
+        {blocked && !error && (
           <div className="rounded-xl border border-red-300 bg-red-50 px-3 py-2.5">
-            <div className="text-[12px] text-red-800">Exceeds outstanding by {formatNaira(overBy)}. Reduce the amount — payments above the outstanding balance are rejected.</div>
+            <div className="text-[12px] text-red-800">{validation.errors[0].message}</div>
+          </div>
+        )}
+        {showWarnings && (
+          <div className="rounded-xl border border-[#FDE68A] bg-[#FFFBEB]/60 px-3 py-2.5">
+            <ul className="space-y-1 text-[12px] text-[#92400E]">
+              {warningList.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+            <label className="mt-2 flex items-start gap-2 text-[12px] text-[#92400E]">
+              <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} className="mt-0.5" />
+              <span>I&apos;ve reviewed the allocation and want to record this payment.</span>
+            </label>
           </div>
         )}
         <div className="grid md:grid-cols-2 gap-3">
           <div>
             <label className="mono text-[11px] text-[var(--ops-muted)]">Payment method</label>
-            <select value={paymentMethod} onChange={(e) => setPaymentMethod(e.target.value)} className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm bg-white"><option>Bank Transfer</option><option>Cash</option><option>Cheque</option><option>POS</option><option>Installment</option></select>
+            <select value={paymentMethod} onChange={(e) => { setPaymentMethod(e.target.value); resetAck(); }} className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm bg-white">{PAYMENT_METHODS.map((m) => <option key={m}>{m}</option>)}</select>
           </div>
           <div>
-            <label className="mono text-[11px] text-[var(--ops-muted)]">Bank / teller reference <span className="normal-case">(optional)</span></label>
-            <input value={bankReference} onChange={(e) => setBankReference(e.target.value)} placeholder="e.g. TRF-88231" className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
+            <label className="mono text-[11px] text-[var(--ops-muted)]">Bank / teller reference {paymentMethod === "Bank Transfer" ? <span className="text-red-600">*</span> : <span className="normal-case">(optional)</span>}</label>
+            <input value={bankReference} onChange={(e) => { setBankReference(e.target.value); resetAck(); }} placeholder="e.g. TRF-88231" className="mt-1 w-full border border-[var(--ops-border)] rounded-xl px-3 py-2 text-sm" />
           </div>
           <div>
             <label className="mono text-[11px] text-[var(--ops-muted)]">Notes</label>
@@ -171,7 +233,7 @@ export default function RecordPaymentForm({
           </div>
         </div>
         <div className="flex justify-end">
-          <button type="submit" disabled={busy || amountNum <= 0 || isOver} className="text-sm bg-[var(--ops-primary)] text-white rounded-full px-6 py-2.5 font-medium hover:bg-[var(--ops-deep)] disabled:opacity-50">{busy ? "Recording…" : "Record Payment for Verification"}</button>
+          <button type="submit" disabled={busy || blocked || validation.requiresAcknowledgement} className="text-sm bg-[var(--ops-primary)] text-white rounded-full px-6 py-2.5 font-medium hover:bg-[var(--ops-deep)] disabled:opacity-50">{busy ? "Recording…" : "Record Payment for Verification"}</button>
         </div>
       </form>
     </div>

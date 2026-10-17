@@ -31,6 +31,9 @@ export type SchedulePayment = {
   status: string;
   isCredit?: boolean;
   creditAmount?: number | null;
+  // Allocation rows written at confirm time — the persisted copy of the
+  // waterfall. Used to attribute a receipt to the installment it settled.
+  allocations?: { installmentId: string; amount: number }[];
 };
 
 export type ScheduleReceipt = { id: string; paymentId: string | null };
@@ -45,6 +48,8 @@ export default function PaymentSchedule({
   receipts,
   outstanding,
   totals,
+  contractDate,
+  existingReferences,
 }: {
   transactionId: string;
   installments: ScheduleInstallment[];
@@ -52,6 +57,8 @@ export default function PaymentSchedule({
   receipts: ScheduleReceipt[];
   outstanding: number;
   totals: { totalPaid: number; totalPayable: number };
+  contractDate?: string | null;
+  existingReferences?: string[];
 }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
 
@@ -60,6 +67,10 @@ export default function PaymentSchedule({
 
   const pendingsFor = (instId: string) => payments.filter((p) => p.installmentId === instId && p.status === "PENDING_VERIFICATION");
   const unlinkedPendings = payments.filter((p) => p.status === "PENDING_VERIFICATION" && !installments.some((i) => i.id === p.installmentId));
+
+  // Which payment(s) settled an installment, from the stored allocation rows.
+  const allocationsFor = (instId: string) =>
+    payments.flatMap((p) => (p.allocations ?? []).filter((a) => a.installmentId === instId).map((a) => ({ paymentId: p.id, amount: a.amount })));
 
   return (
     <div className="bg-[var(--ops-surface)] border border-[var(--ops-border)] rounded-[var(--ops-radius)] p-6 shadow-[var(--ops-shadow-sm)]">
@@ -81,9 +92,16 @@ export default function PaymentSchedule({
           </thead>
           <tbody className="divide-y divide-[var(--ops-border)]/60">
             {installments.map((inst) => {
-              const confirmed = payments.filter((p) => p.installmentId === inst.id && p.status === "CONFIRMED");
               const pendings = pendingsFor(inst.id);
-              const receiptLink = confirmed.length > 0 ? receipts.find((r) => confirmed.some((p) => p.id === r.paymentId)) : null;
+              // Receipt link: the schedule's Paid column is the waterfall
+              // replay (inst.confirmedPaid), so the receipt shown must be one
+              // that actually settled THIS installment. Resolve it from the
+              // allocations the confirm step wrote, not the payment pointer.
+              const receiptLink = (() => {
+                const alloc = allocationsFor(inst.id);
+                const ids = new Set(alloc.map((a) => a.paymentId));
+                return receipts.find((r) => r.paymentId && ids.has(r.paymentId)) ?? null;
+              })();
               return (
                 <Fragment key={inst.id}>
                   <tr className="hover:bg-[var(--ops-bg)]/30">
@@ -162,6 +180,8 @@ export default function PaymentSchedule({
               outstanding={outstanding}
               totalPaid={totals.totalPaid}
               totalPayable={totals.totalPayable}
+              contractDate={contractDate}
+              existingReferences={existingReferences}
               onDone={() => setDrawerOpen(false)}
             />
           </div>
