@@ -1,6 +1,8 @@
 import type { Prisma } from "@/generated/prisma/client";
+import type { InstallmentStatus } from "@/generated/prisma/enums";
 import { createHash } from "node:crypto";
 import { lagosDayKey } from "@/lib/time";
+import { replayAllocationDetail, type AllocationInstallment, type InstallmentAllocation } from "./allocations";
 
 // Single ledger service (Step 2): the ONLY code allowed to write money
 // entries (LedgerEntry) and allocation rows (PaymentAllocation), and to
@@ -39,6 +41,16 @@ export class LedgerError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "LedgerError";
+  }
+}
+
+// Thrown when the stored money columns disagree with the confirmed-payment
+// history after a write. Lives here (ledger-domain corruption) so both
+// payment confirmation and reversal can raise it without a circular import.
+export class PaymentCorruptStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PaymentCorruptStateError";
   }
 }
 
@@ -305,6 +317,161 @@ export async function postAllocations(
     });
   }
   return sum;
+}
+
+// ---------------------------------------------------------------------------
+// Recompute: the single writer of allocation rows. Given a transaction, it
+// replays every CONFIRMED payment (date order) through the waterfall from the
+// earliest open installment and rewrites the persisted state to match:
+//   - PaymentAllocation rows (the audit copy),
+//   - each installment's paidAmount + status,
+//   - each confirmed payment's isCredit / creditAmount,
+// and returns the derived totals. This is what makes the stored columns agree
+// with what every read path derives, so dashboard, summary and receipt cannot
+// drift. WAIVED installments are never allocated or rewritten.
+// ---------------------------------------------------------------------------
+
+export type RecomputeResult = {
+  installments: InstallmentAllocation[];
+  creditByPayment: Map<string, number>;
+  totalPaid: number;
+  credit: number;
+};
+
+export async function recomputeTransactionAllocations(
+  tx: TxClient,
+  transactionId: string,
+  opts: {
+    now?: Date;
+    // Injected so ledger.ts never imports paymentConfirmation (avoids a cycle).
+    deriveStatus: (confirmedPaid: number, scheduledAmount: number, dueDate: Date, now: Date) => InstallmentStatus;
+  }
+): Promise<RecomputeResult> {
+  const now = opts.now ?? new Date();
+  const all = await tx.installment.findMany({
+    where: { transactionId },
+    orderBy: { installmentNumber: "asc" },
+  });
+  const active = all.filter((i) => i.status !== "WAIVED");
+  const confirmed = await tx.payment.findMany({
+    where: { transactionId, status: "CONFIRMED" },
+  });
+  const detail = replayAllocationDetail(
+    active.map(
+      (i): AllocationInstallment => ({
+        id: i.id,
+        installmentNumber: i.installmentNumber,
+        type: i.type,
+        dueDate: i.dueDate,
+        scheduledAmount: i.scheduledAmount,
+      })
+    ),
+    confirmed.map((p) => ({
+      id: p.id,
+      amount: p.amount,
+      paymentDate: p.paymentDate,
+      status: p.status,
+    }))
+  );
+
+  const confirmedIds = confirmed.map((p) => p.id);
+  if (confirmedIds.length > 0) {
+    await tx.paymentAllocation.deleteMany({ where: { paymentId: { in: confirmedIds } } });
+  }
+
+  const creditByPayment = new Map<string, number>();
+  for (const pr of detail.payments) {
+    for (const a of pr.allocations) {
+      assertWholeNaira(a.amount, "allocation amount");
+      await tx.paymentAllocation.create({
+        data: { paymentId: pr.paymentId, installmentId: a.installmentId, amount: a.amount },
+      });
+    }
+    creditByPayment.set(pr.paymentId, pr.credit);
+    await tx.payment.update({
+      where: { id: pr.paymentId },
+      data: { isCredit: pr.credit > 0, creditAmount: pr.credit > 0 ? pr.credit : null },
+    });
+  }
+
+  for (const inst of detail.installments) {
+    await tx.installment.update({
+      where: { id: inst.id },
+      data: {
+        paidAmount: inst.confirmedPaid,
+        status: opts.deriveStatus(inst.confirmedPaid, inst.scheduledAmount, inst.dueDate, now),
+        updatedAt: now,
+      },
+    });
+  }
+
+  const totalPaid = detail.installments.reduce((s, i) => s + i.confirmedPaid, 0) + detail.credit;
+  return { installments: detail.installments, creditByPayment, totalPaid, credit: detail.credit };
+}
+
+// Pre-commit guard: the stored money columns must equal the confirmed-payment
+// history, every payment's allocations plus its credit must equal its amount,
+// and every installment's stored paid must equal what was allocated to it.
+// Throws PaymentCorruptStateError (which fails the whole DB transaction, so no
+// receipt is ever written for a corrupt save).
+export async function assertTransactionInvariants(
+  tx: TxClient,
+  transactionId: string,
+  opts: { expectedTotalPaid: number }
+): Promise<void> {
+  const txn = await tx.transaction.findUnique({ where: { id: transactionId } });
+  if (!txn) {
+    throw new PaymentCorruptStateError("Transaction row disappeared mid-save");
+  }
+  const payments = await tx.payment.findMany({ where: { transactionId, status: "CONFIRMED" } });
+  const confirmedSum = payments.reduce((s, p) => s + p.amount, 0);
+  if (txn.totalPaid !== confirmedSum) {
+    throw new PaymentCorruptStateError(
+      `Stored total paid ${txn.totalPaid} disagrees with confirmed payments ${confirmedSum}`
+    );
+  }
+  const expectedOutstanding = txn.totalPayable - confirmedSum;
+  if (txn.outstandingBalance !== expectedOutstanding) {
+    throw new PaymentCorruptStateError(
+      `Stored outstanding ${txn.outstandingBalance} disagrees with computed ${expectedOutstanding}`
+    );
+  }
+  if (opts.expectedTotalPaid !== confirmedSum) {
+    throw new PaymentCorruptStateError(
+      `Recomputed total ${opts.expectedTotalPaid} disagrees with confirmed payments ${confirmedSum}`
+    );
+  }
+
+  const ids = payments.map((p) => p.id);
+  const allocs =
+    ids.length > 0
+      ? await tx.paymentAllocation.findMany({ where: { paymentId: { in: ids } } })
+      : [];
+  const byPayment = new Map<string, number>();
+  const byInstallment = new Map<string, number>();
+  for (const a of allocs) {
+    byPayment.set(a.paymentId, (byPayment.get(a.paymentId) ?? 0) + a.amount);
+    byInstallment.set(a.installmentId, (byInstallment.get(a.installmentId) ?? 0) + a.amount);
+  }
+  for (const p of payments) {
+    const credit = p.isCredit ? (p.creditAmount ?? 0) : 0;
+    const allocSum = byPayment.get(p.id) ?? 0;
+    if (allocSum + credit !== p.amount) {
+      throw new PaymentCorruptStateError(
+        `Payment ${p.paymentReference ?? p.id}: allocated ${allocSum} + credit ${credit} != amount ${p.amount}`
+      );
+    }
+  }
+  const installments = await tx.installment.findMany({ where: { transactionId } });
+  for (const inst of installments) {
+    if (inst.status === "WAIVED") continue;
+    const allocSum = byInstallment.get(inst.id) ?? 0;
+    if ((inst.paidAmount ?? 0) !== allocSum) {
+      throw new PaymentCorruptStateError(
+        `Installment #${inst.installmentNumber}: stored paid ${inst.paidAmount} != allocated ${allocSum}`
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

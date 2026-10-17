@@ -9,6 +9,7 @@
 import "dotenv/config";
 import { prisma } from "../src/lib/prisma.js";
 import { deriveInstallmentStatus } from "../src/lib/paymentConfirmation.js";
+import { replayAllocation, type AllocationInstallment } from "../src/lib/finance/allocations.js";
 
 const APPLY = process.argv.includes("--apply");
 const INCLUDE_TEST = process.argv.includes("--include-test");
@@ -19,16 +20,32 @@ const directFilter: { isTest?: boolean } = INCLUDE_TEST ? {} : { isTest: false }
 async function main() {
   const installments = await prisma.installment.findMany({
     where: { ...relFilter },
-    select: { id: true, installmentNumber: true, scheduledAmount: true, paidAmount: true, status: true, dueDate: true, transactionId: true, transaction: { select: { ref: true } } },
+    select: { id: true, installmentNumber: true, type: true, scheduledAmount: true, paidAmount: true, status: true, dueDate: true, transactionId: true, transaction: { select: { ref: true } } },
     orderBy: { dueDate: "asc" },
   });
   const confirmed = await prisma.payment.findMany({
     where: { status: "CONFIRMED", ...relFilter },
-    select: { amount: true, installmentId: true },
+    select: { id: true, amount: true, paymentDate: true, status: true, transactionId: true },
   });
-  const paidByInst = new Map<string, number>();
+  // Per-installment truth is the waterfall replay of each transaction's
+  // confirmed payments — the same rule the finance service reads — so stored
+  // paidAmount/status can never drift from what every screen shows.
+  const instByTxn = new Map<string, AllocationInstallment[]>();
+  for (const i of installments) {
+    const list = instByTxn.get(i.transactionId) ?? [];
+    list.push({ id: i.id, installmentNumber: i.installmentNumber, type: i.type, dueDate: i.dueDate, scheduledAmount: i.scheduledAmount });
+    instByTxn.set(i.transactionId, list);
+  }
+  const payByTxn = new Map<string, typeof confirmed>();
   for (const p of confirmed) {
-    if (p.installmentId) paidByInst.set(p.installmentId, (paidByInst.get(p.installmentId) ?? 0) + p.amount);
+    const list = payByTxn.get(p.transactionId) ?? [];
+    list.push(p);
+    payByTxn.set(p.transactionId, list);
+  }
+  const paidByInst = new Map<string, number>();
+  for (const [txnId, insts] of instByTxn) {
+    const { installments: allocated } = replayAllocation(insts, payByTxn.get(txnId) ?? []);
+    for (const a of allocated) paidByInst.set(a.id, a.confirmedPaid);
   }
   const now = new Date();
   let drift = 0;

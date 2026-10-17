@@ -1,11 +1,31 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // POST /api/admin/transactions/[id]/payments: free amount, enforced
-// idempotency key, explicit-credit overpayment, backdate audit. The old
-// 60-second duplicate window is gone — the unique key is the enforcer.
+// idempotency key, shared validation (hard blocks + acknowledged warnings),
+// backdate audit. The old 60-second duplicate window is gone — the unique key
+// is the enforcer.
 
 const store = { payments: [] as Record<string, unknown>[], audits: [] as Record<string, unknown>[] };
-const txn = { id: "txn-1", status: "ACTIVE", outstandingBalance: 1_000_000 };
+const txn = {
+  id: "txn-1",
+  ref: "TXN-1",
+  status: "ACTIVE",
+  isTest: false,
+  totalPayable: 1_000_000,
+  outstandingBalance: 1_000_000,
+  createdAt: new Date("2026-01-01T00:00:00.000Z"),
+  installments: [
+    {
+      id: "inst-1",
+      transactionId: "txn-1",
+      installmentNumber: 1,
+      type: "INSTALLMENT",
+      dueDate: new Date("2027-01-01T12:00:00.000Z"),
+      scheduledAmount: 1_000_000,
+      status: "PENDING",
+    },
+  ],
+};
 
 vi.mock("@/auth", () => ({
   auth: async () => ({ user: { id: "u1", name: "Admin", email: "admin@x.com", role: "admin" } }),
@@ -28,9 +48,11 @@ vi.mock("@/lib/prisma", () => ({
     payment: {
       findUnique: async (args: { where: { idempotencyKey: string } }) =>
         store.payments.find((p) => p.idempotencyKey === args.where.idempotencyKey) ?? null,
+      findMany: async () => store.payments.slice(),
       findFirst: async () => null, // ref-gen collision check
       create: createPayment,
     },
+    installment: { findMany: async () => txn.installments },
     $transaction: async (cb: (tx: unknown) => Promise<unknown>) =>
       cb({
         payment: { create: createPayment },
@@ -61,6 +83,8 @@ const base = {
   amount: 400_000,
   paymentDate: new Date().toISOString().slice(0, 10),
   paymentMethod: "Bank Transfer",
+  bankReference: "TRF-BASE-1",
+  allocationReviewed: true,
 };
 
 beforeEach(() => {
@@ -166,5 +190,54 @@ describe("POST record payment", () => {
     await POST(recordRequest({ ...base, idempotencyKey: "today-key-1" }), ctx);
     const after = (store.audits[0].data as Record<string, unknown>).after as Record<string, unknown>;
     expect(after).toMatchObject({ backdated: false });
+  });
+
+  it("blocks a Bank Transfer with no reference", async () => {
+    const res = await POST(
+      recordRequest({ ...base, bankReference: "  ", idempotencyKey: "noref-key-1" }),
+      ctx
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining("reference is required") });
+    expect(store.payments).toHaveLength(0);
+  });
+
+  it("blocks a duplicate bank reference on the same transaction", async () => {
+    const first = await POST(recordRequest({ ...base, idempotencyKey: "dup-key-1" }), ctx);
+    expect(first.status).toBe(201);
+    const second = await POST(
+      recordRequest({ ...base, bankReference: " trf-base-1 ", idempotencyKey: "dup-key-2" }),
+      ctx
+    );
+    expect(second.status).toBe(400);
+    expect(await second.json()).toMatchObject({ error: expect.stringContaining("already recorded") });
+    expect(store.payments).toHaveLength(1);
+  });
+
+  it("blocks a payment dated before the contract or in the future", async () => {
+    const before = await POST(
+      recordRequest({ ...base, paymentDate: "2025-12-01", idempotencyKey: "date-1" }),
+      ctx
+    );
+    expect(before.status).toBe(400);
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    const future = await POST(
+      recordRequest({ ...base, paymentDate: tomorrow, idempotencyKey: "date-2" }),
+      ctx
+    );
+    expect(future.status).toBe(400);
+    expect(store.payments).toHaveLength(0);
+  });
+
+  it("requires an acknowledgement before a shortfall/spill is recorded", async () => {
+    const res = await POST(
+      recordRequest({ ...base, allocationReviewed: false, idempotencyKey: "ack-key-1" }),
+      ctx
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ needsAllocationReview: true });
+    expect(body.warnings[0].code).toBe("UNDERPAYMENT_SHORTFALL");
+    expect(store.payments).toHaveLength(0);
   });
 });

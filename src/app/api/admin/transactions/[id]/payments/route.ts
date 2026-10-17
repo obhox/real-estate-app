@@ -5,6 +5,8 @@ import { auth } from "@/auth";
 import { isInternalRole } from "@/lib/authz";
 import { generateUniquePaymentRef } from "@/lib/ref";
 import { lagosDayKey, toDateOnlyNoonUtc } from "@/lib/time";
+import { validatePayment } from "@/lib/paymentValidation";
+import { getTransactionSummary } from "@/lib/finance";
 
 export async function POST(request: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const session = await auth();
@@ -16,10 +18,8 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   // Free amount: the schedule is a guide, never a gate. No installment picker
   // — confirmation waterfalls from the oldest unpaid installment, and any
   // amount above the outstanding balance auto-parks as visible credit.
-  const { amount, paymentDate, paymentMethod, bankReference, notes, idempotencyKey } = body;
-  // Money is integer naira (schema Int) — reject floats, not just non-numbers.
+  const { amount, paymentDate, paymentMethod, bankReference, notes, idempotencyKey, allocationReviewed } = body;
   const amt = Number(amount);
-  if (!Number.isInteger(amt) || amt <= 0) return NextResponse.json({ error: "Enter a whole-naira amount" }, { status: 400 });
 
   // Effective dates are calendar dates: normalize to noon UTC (stable under
   // DATE and timestamp columns in every zone) via the shared helper.
@@ -42,23 +42,8 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
     if (!transaction) return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
     if (transaction.status === "CANCELLED") return NextResponse.json({ error: "Transaction is cancelled" }, { status: 400 });
 
-    // The ONLY gate (same rule as confirm time): cumulative recorded
-    // payments must not exceed the account's total balance. Any amount at or
-    // below the outstanding balance records freely — no per-installment
-    // checks. The confirm step re-checks atomically inside its transaction,
-    // so this fail-fast read can never be bypassed by a race.
-    const overBy = amt - transaction.outstandingBalance;
-    if (overBy > 0) {
-      return NextResponse.json(
-        {
-          error: `This payment of ₦${amt.toLocaleString("en-NG")} exceeds the outstanding balance of ₦${transaction.outstandingBalance.toLocaleString("en-NG")}. Reduce the amount — payments above the outstanding balance are rejected.`,
-        },
-        { status: 400 }
-      );
-    }
-    const wantsCredit = false;
-
-    // Idempotent replay: same key returns the existing row, never a second one.
+    // Idempotent replay FIRST: a genuine retry of the same key must return the
+    // existing row, never be re-judged by the duplicate-reference rule below.
     const existing = await prisma.payment.findUnique({ where: { idempotencyKey: key } });
     if (existing) {
       if (existing.transactionId !== id) {
@@ -66,6 +51,41 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
       }
       return NextResponse.json({ payment: existing, deduped: true });
     }
+
+    // One shared rule set, run here exactly as the form runs it. Hard blocks
+    // stop the record; warnings (spill / shortfall) require an explicit
+    // acknowledgement. Outstanding and next-due come from the finance
+    // service, so this check reads the same derived figures everything else
+    // does. The confirm step re-checks atomically inside its transaction, so
+    // a race can never bypass either.
+    const summary = await getTransactionSummary(id);
+    if (!summary) return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
+    const refRows = await prisma.payment.findMany({
+      where: { transactionId: id, bankReference: { not: null }, status: { not: "CANCELLED" } },
+      select: { bankReference: true },
+    });
+    const validation = validatePayment({
+      amount: amt,
+      paymentDate: date,
+      paymentMethod: typeof paymentMethod === "string" ? paymentMethod : "Bank Transfer",
+      bankReference: typeof bankReference === "string" ? bankReference : null,
+      contractDate: transaction.createdAt,
+      totalPayable: summary.totalPayable,
+      outstandingBalance: summary.outstanding,
+      dueNow: summary.nextInstallment?.amountDue ?? 0,
+      existingReferences: refRows.map((r) => r.bankReference),
+      allocationReviewed: allocationReviewed === true,
+    });
+    if (validation.errors.length > 0) {
+      return NextResponse.json({ error: validation.errors[0].message, errors: validation.errors }, { status: 400 });
+    }
+    if (validation.requiresAcknowledgement) {
+      return NextResponse.json(
+        { error: validation.warnings[0].message, warnings: validation.warnings, needsAllocationReview: true },
+        { status: 409 }
+      );
+    }
+    const wantsCredit = false;
 
     // Backdated payments are allowed; the audit trail records both dates.
     const backdated = lagosDayKey(date) < lagosDayKey(new Date());
@@ -82,7 +102,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
             amount: amt,
             paymentDate: date,
             paymentMethod: paymentMethod || "Bank Transfer",
-            bankReference: bankReference || null,
+            bankReference: typeof bankReference === "string" && bankReference.trim() ? bankReference.trim() : null,
             notes: notes || null,
             status: "PENDING_VERIFICATION",
             recordedById: session!.user.id,

@@ -2,11 +2,17 @@ import type { Prisma } from "@/generated/prisma/client";
 import { amountToWords } from "./receipts/amountToWords";
 import { formatDateDMY } from "./time";
 import {
-  planAllocationCapped,
   postPaymentEntry,
-  postAllocations,
   postLedgerEntry,
+  recomputeTransactionAllocations,
+  assertTransactionInvariants,
+  PaymentCorruptStateError,
 } from "./finance/ledger";
+
+// Corruption is a ledger-domain failure; the class lives in ledger.ts so the
+// recompute/assert helpers can raise it without a circular import. Re-exported
+// here so existing import paths (routes, toUserFacingError) keep working.
+export { PaymentCorruptStateError };
 
 // Shared payment-confirmation core: database work ONLY. No PDF rendering,
 // no filesystem access, no email, no network. Slow or fallible side effects
@@ -69,13 +75,6 @@ export class OverScheduleError extends Error {
     this.paidAmount = paidAmount;
     this.amount = amount;
     this.scheduledAmount = scheduledAmount;
-  }
-}
-
-export class PaymentCorruptStateError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "PaymentCorruptStateError";
   }
 }
 
@@ -234,13 +233,10 @@ export async function applyConfirmationDbUnit(tx: TxClient, input: ConfirmDbInpu
     const existingTotal = totalAfterClaim - payment.amount;
     throw new TotalBalanceExceededError(existingTotal, payment.amount, transaction.totalPayable);
   }
-  // Whatever fits the total but not the remaining schedule (only possible
-  // with pre-existing credit capacity) still parks as this payment's visible
-  // credit balance via the capped allocation below — never truncated, and
-  // never a reason to reject a payment that fits the total balance.
-  const wasExplicitCredit = payment.isCredit === true;
-
-  // Resolve the installment: the payment's own, else the next unpaid one.
+  // Resolve the installment pointer: the payment's own, else the next unpaid
+  // one. This is display metadata only (the receipt's payment description);
+  // the money itself is placed by the waterfall recompute below, which never
+  // trusts this pointer.
   let installment =
     payment.installmentId != null
       ? await tx.installment.findUnique({ where: { id: payment.installmentId } })
@@ -257,85 +253,35 @@ export async function applyConfirmationDbUnit(tx: TxClient, input: ConfirmDbInpu
     }
   }
 
-  let creditAmountThisPayment = 0;
-  if (installment) {
-    // Waterfall allocation (owned by the ledger service): confirmed money
-    // fills the targeted installment, and any excess rolls forward into
-    // successive installments (never backward). Any remainder past the final
-    // installment is parked as this payment's visible credit balance
-    // (recorded on the payment row below) — never truncated, never rejected.
-    const ordered = [...transaction.installments].sort((a, b) => a.installmentNumber - b.installmentNumber);    const freshRows = [];
-    for (const inst of ordered) {
-      const fresh = await tx.installment.findUnique({ where: { id: inst.id } });
-      if (!fresh) throw new PaymentCorruptStateError("Installment row disappeared mid-transaction");
-      freshRows.push(fresh);
-    }
-    const capped = planAllocationCapped(
-      freshRows.map((f) => ({
-        id: f.id,
-        installmentNumber: f.installmentNumber,
-        scheduledAmount: f.scheduledAmount,
-        paidAmount: f.paidAmount ?? 0,
-      })),
-      installment.id,
-      payment.amount
-    );
-    const plan = capped.plan;
-    const creditAmount = capped.remainder;
-    creditAmountThisPayment = creditAmount;
-    if (creditAmount > 0) {
-      await tx.payment.update({ where: { id: payment.id }, data: { isCredit: true, creditAmount } });
-    }
-    for (const step of plan) {
-      const fresh = freshRows.find((r) => r.id === step.installmentId)!;
-      const newPaid = (fresh.paidAmount ?? 0) + step.amount;
-      await tx.installment.update({
-        where: { id: step.installmentId },
-        data: {
-          paidAmount: newPaid,
-          status: deriveInstallmentStatus(newPaid, fresh.scheduledAmount, new Date(fresh.dueDate), now),
-          updatedAt: now,
-        },
-      });
-    }
-    // Ledger dual-write (same tx): the PAYMENT entry + allocation rows.
-    // Legacy stored columns above stay the read source until the ledger
-    // backfill is verified — verifyTransactionLedger() proves they agree.
-    await postPaymentEntry(tx, {
-      transactionId: transaction.id,
-      paymentId: payment.id,
-      amount: payment.amount,
-      effectiveDate: new Date(payment.paymentDate),
-      method: payment.paymentMethod,
-      bankReference: payment.bankReference,
-      recordedById: input.confirmedById ?? null,
-    });
-    await postAllocations(tx, payment.id, plan);
-  } else {
-    // No installment to allocate against (creation always builds a schedule,
-    // so this should not happen): the full amount parks as visible credit
-    // rather than blocking the confirmation.
-    creditAmountThisPayment = payment.amount;
-    await tx.payment.update({ where: { id: payment.id }, data: { isCredit: true, creditAmount: payment.amount } });
-  }
-
-  // Totals derive from CONFIRMED payments only — recomputed, never incremented.
-  const confirmed = await tx.payment.findMany({
-    where: { transactionId: transaction.id, status: "CONFIRMED" },
+  // Single writer for allocations: replay every confirmed payment (including
+  // this one) through the waterfall from the earliest open installment, then
+  // rewrite the PaymentAllocation rows, each installment's paid/status, and
+  // each payment's credit to match. One uniform rule — the same one every read
+  // path derives from — so the stored columns can never drift.
+  const recomputed = await recomputeTransactionAllocations(tx, transaction.id, {
+    now,
+    deriveStatus: deriveInstallmentStatus,
   });
-  const newTotalPaid = confirmed.reduce((sum, p) => sum + p.amount, 0);
+
+  // Ledger entry (same tx): the PAYMENT record for this confirmation. The
+  // recompute owns the allocation rows; the ledger owns the money entry.
+  await postPaymentEntry(tx, {
+    transactionId: transaction.id,
+    paymentId: payment.id,
+    amount: payment.amount,
+    effectiveDate: new Date(payment.paymentDate),
+    method: payment.paymentMethod,
+    bankReference: payment.bankReference,
+    recordedById: input.confirmedById ?? null,
+  });
+
+  const newTotalPaid = recomputed.totalPaid;
   const newOutstanding = transaction.totalPayable - newTotalPaid;
-  if (newOutstanding < 0) {
-    // Negative outstanding is the visible credit balance. The total-balance
-    // gate above rejects new over-balance payments, so this is reachable
-    // only for pre-existing credit history. Anything else is corruption.
-    const hasCredit =
-      creditAmountThisPayment > 0 ||
-      wasExplicitCredit ||
-      (await tx.payment.findFirst({ where: { transactionId: transaction.id, status: "CONFIRMED", isCredit: true }, select: { id: true } })) !== null;
-    if (!hasCredit) {
-      throw new PaymentCorruptStateError("Confirmed payments exceed the transaction total");
-    }
+  if (newOutstanding < 0 && recomputed.credit <= 0) {
+    // Negative outstanding is the visible credit balance (money confirmed past
+    // the schedule). The total-balance gate above rejects new over-balance
+    // payments, so a negative balance with no credit anywhere is corruption.
+    throw new PaymentCorruptStateError("Confirmed payments exceed the transaction total");
   }
   const isPaidInFull = newOutstanding <= 0;
 
@@ -351,10 +297,14 @@ export async function applyConfirmationDbUnit(tx: TxClient, input: ConfirmDbInpu
 
   if (isPaidInFull) {
     await tx.installment.updateMany({
-      where: { transactionId: transaction.id, status: { not: "PAID" } },
+      where: { transactionId: transaction.id, status: { notIn: ["PAID", "WAIVED"] } },
       data: { status: "PAID" },
     });
   }
+
+  // Fail the whole save (no receipt) if stored money disagrees with the
+  // confirmed-payment history.
+  await assertTransactionInvariants(tx, transaction.id, { expectedTotalPaid: newTotalPaid });
 
   const issuedDateStr = formatDateDMY(payment.paymentDate);
   const receipt = await tx.receipt.create({
@@ -477,45 +427,17 @@ export async function reverseConfirmedPaymentDbUnit(
   });
   if (!transaction) throw new PaymentCorruptStateError("Transaction row disappeared mid-transaction");
 
-  // Money is fungible across the schedule: remove this payment's amount
-  // starting from its targeted installment and rolling forward (the mirror
-  // of waterfall allocation), wrapping to the earliest rows if needed so
-  // interleaved confirms/reversals always remove exactly this amount.
-  // Per-installment attribution can drift in exotic interleave orders, but
-  // totals and derived statuses stay exact — and paidAmount never goes
-  // negative (a shortfall throws loudly instead of corrupting the books).
-  const ordered = [...(transaction.installments ?? [])].sort((a, b) => a.installmentNumber - b.installmentNumber);
-  const startIdx = Math.max(
-    0,
-    ordered.findIndex((i) => i.id === payment.installmentId)
-  );
-  const rotation = [...ordered.slice(startIdx), ...ordered.slice(0, startIdx)];
-  let toRemove = payment.amount;
-  for (const inst of rotation) {
-    if (toRemove <= 0) break;
-    const fresh = await tx.installment.findUnique({ where: { id: inst.id } });
-    if (!fresh) throw new PaymentCorruptStateError("Installment row disappeared mid-transaction");
-    const take = Math.min(toRemove, fresh.paidAmount ?? 0);
-    if (take <= 0) continue;
-    const newPaid = (fresh.paidAmount ?? 0) - take;
-    await tx.installment.update({
-      where: { id: fresh.id },
-      data: {
-        paidAmount: newPaid,
-        status: deriveInstallmentStatus(newPaid, fresh.scheduledAmount, new Date(fresh.dueDate), now),
-        updatedAt: now,
-      },
-    });
-    toRemove -= take;
-  }
-  if (toRemove > 0) {
-    throw new PaymentCorruptStateError("Reversal would drive installment balances negative");
-  }
-
-  const confirmed = await tx.payment.findMany({
-    where: { transactionId: transaction.id, status: "CONFIRMED" },
+  // The voided payment is no longer confirmed, so drop its allocation rows
+  // explicitly (the recompute below only rewrites rows for payments that
+  // remain confirmed). Then replay the surviving confirmed history to rebuild
+  // the schedule — a reversal is exactly the same uniform rule applied to one
+  // fewer payment, so interleaved confirms/voids can never drift the books.
+  await tx.paymentAllocation.deleteMany({ where: { paymentId: payment.id } });
+  const recomputed = await recomputeTransactionAllocations(tx, transaction.id, {
+    now,
+    deriveStatus: deriveInstallmentStatus,
   });
-  const newTotalPaid = confirmed.reduce((sum, p) => sum + p.amount, 0);
+  const newTotalPaid = recomputed.totalPaid;
   const newOutstanding = transaction.totalPayable - newTotalPaid;
 
   await tx.transaction.update({
@@ -531,8 +453,12 @@ export async function reverseConfirmedPaymentDbUnit(
     },
   });
 
+  // Fail the whole void (no audit row) if stored money disagrees with the
+  // surviving confirmed history.
+  await assertTransactionInvariants(tx, transaction.id, { expectedTotalPaid: newTotalPaid });
+
   // Ledger dual-write (same tx): a REVERSAL DEBIT against the original
-  // PAYMENT entry, and removal of this payment's allocation rows (they are
+  // PAYMENT entry. This payment's allocation rows were removed above (they are
   // attribution of live money — the REVERSAL entry is the money record).
   // Pre-ledger rows have no PAYMENT entry (backfill ordering); skipping the
   // REVERSAL then is safe — the stored reversal above still applies — but it
@@ -553,7 +479,6 @@ export async function reverseConfirmedPaymentDbUnit(
   } else {
     logServerError(`void payment ${payment.id}: no PAYMENT ledger entry (pre-backfill row?)`, null);
   }
-  await tx.paymentAllocation.deleteMany({ where: { paymentId: payment.id } });
 
   await tx.auditEvent.create({
     data: {

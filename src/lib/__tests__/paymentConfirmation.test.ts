@@ -130,6 +130,12 @@ function makeMockTx(state: MockState): TxClient {
         const { where } = args as { where: { id: string } };
         return state.installments.find((i) => i.id === where.id) ?? null;
       },
+      findMany: async (args: unknown) => {
+        const { where } = args as { where: { transactionId: string } };
+        return state.installments
+          .filter((i) => i.transactionId === where.transactionId)
+          .sort((a, b) => a.installmentNumber - b.installmentNumber);
+      },
       update: async (args: unknown) => {
         const { where, data } = args as { where: { id: string }; data: Record<string, unknown> };
         const inst = state.installments.find((i) => i.id === where.id);
@@ -139,12 +145,20 @@ function makeMockTx(state: MockState): TxClient {
       },
       updateMany: async (args: unknown) => {
         const { where, data } = args as {
-          where: { transactionId: string; status: { not: string } };
+          where: { transactionId: string; status: { not?: string; notIn?: string[] } };
           data: Record<string, unknown>;
         };
         let count = 0;
         for (const inst of state.installments) {
-          if (inst.transactionId === where.transactionId && inst.status !== where.status.not) {
+          if (inst.transactionId !== where.transactionId) continue;
+          const s = where.status;
+          const matches =
+            s.not !== undefined
+              ? inst.status !== s.not
+              : Array.isArray(s.notIn)
+                ? !s.notIn.includes(inst.status)
+                : true;
+          if (matches) {
             Object.assign(inst, data);
             count++;
           }
@@ -192,10 +206,20 @@ function makeMockTx(state: MockState): TxClient {
         state.allocs.push(row);
         return row;
       },
+      findMany: async (args: unknown) => {
+        const { where } = args as { where: { paymentId: string | { in: string[] } } };
+        const pid = where.paymentId;
+        const ids = typeof pid === "string" ? [pid] : pid.in;
+        return state.allocs.filter((a) => ids.includes((a as { paymentId: string }).paymentId));
+      },
       deleteMany: async (args: unknown) => {
-        const { where } = args as { where: { paymentId: string } };
+        const { where } = args as { where: { paymentId: string | { in: string[] } } };
+        const pid = where.paymentId;
+        const ids = typeof pid === "string" ? [pid] : pid.in;
         const before = state.allocs.length;
-        state.allocs = state.allocs.filter((a) => (a as { paymentId: string }).paymentId !== where.paymentId);
+        state.allocs = state.allocs.filter(
+          (a) => !ids.includes((a as { paymentId: string }).paymentId)
+        );
         return { count: before - state.allocs.length };
       },
     },
@@ -382,24 +406,26 @@ describe("applyConfirmationDbUnit", () => {
     expect(state.receipts).toHaveLength(1); // no second receipt
   });
 
-  it("confirms beyond the scheduled amount: capped allocation, excess parked as credit", async () => {    const state = seed2900();
-    state.installments[0].paidAmount = 2_000_000;
-    state.installments[0].status = "PARTIALLY_PAID";
-    state.payments.push({ ...pendingPayment("pay-2"), amount: 1_500_000 });
+  it("confirms beyond the scheduled amount: capped allocation, excess parked as credit", async () => {
+    // Schedule is smaller than the amount payable (a fee/premium outside the
+    // plan), so a payment that clears the plan leaves a genuine credit balance.
+    const state = seed2900();
+    state.installments[0].scheduledAmount = 2_300_000;
+    state.payments.push({ ...pendingPayment("pay-2"), amount: 2_900_000 });
     const tx = makeMockTx(state);
 
     const result = await applyConfirmationDbUnit(tx, { paymentId: "pay-2", transactionId: "txn-1", ...REF_BASE });
 
-    // 900k of schedule capacity filled, 600k parked as visible credit.
-    expect(result.newTotalPaid).toBe(1_500_000);
-    expect(result.newOutstanding).toBe(1_400_000);
-    expect(result.isPaidInFull).toBe(false);
-    expect(state.installments[0].paidAmount).toBe(2_900_000);
+    // 2.3M of schedule capacity filled, 600k parked as visible credit.
+    expect(result.newTotalPaid).toBe(2_900_000);
+    expect(result.newOutstanding).toBe(0);
+    expect(result.isPaidInFull).toBe(true);
+    expect(state.installments[0].paidAmount).toBe(2_300_000);
     expect(state.installments[0].status).toBe("PAID");
     expect(state.payments.find((p) => p.id === "pay-2")).toMatchObject({ isCredit: true, creditAmount: 600_000 });
     expect(state.receipts).toHaveLength(1);
     const allocSum = state.allocs.reduce((s, a) => s + ((a as { amount: number }).amount), 0);
-    expect(allocSum).toBe(900_000);
+    expect(allocSum).toBe(2_300_000);
   });
 
   it("over-balance payment is rejected even when explicitly marked credit", async () => {
@@ -949,8 +975,8 @@ describe("total-balance gate (parametrized across accounts)", () => {
     }
   });
 
-  it("payment targeting a later installment before an earlier one is accepted", async () => {
-    // Split: pay #2 in full while #1 is still unpaid.
+  it("a payment aimed at a later installment still fills the earliest open one (never skips ahead)", async () => {
+    // Split: the pointer says #2, but #0 is still open — money fills #0 first.
     const split = gateAccounts().split;
     gatePending(split, "new-1", 2_000_000, "inst-2");
     const r1 = await applyConfirmationDbUnit(makeMockTx(split), {
@@ -959,11 +985,13 @@ describe("total-balance gate (parametrized across accounts)", () => {
       ...REF_BASE,
     });
     expect(r1.newTotalPaid).toBe(5_000_000);
-    expect(split.installments[2].paidAmount).toBe(2_000_000);
+    expect(split.installments[0].paidAmount).toBe(5_000_000);
+    expect(split.installments[0].status).toBe("PAID");
     expect(split.installments[1].paidAmount).toBe(0);
+    expect(split.installments[2].paidAmount).toBe(0);
     expectGateStateReconciles(split);
 
-    // Near-full: pay #3 while #2 is still unpaid.
+    // Near-full: the pointer says #3, but #2 is the earliest open one.
     const near = gateAccounts().nearfull;
     gatePending(near, "new-1", 656_250, "inst-3");
     await applyConfirmationDbUnit(makeMockTx(near), {
@@ -971,8 +999,9 @@ describe("total-balance gate (parametrized across accounts)", () => {
       transactionId: "txn-1",
       ...REF_BASE,
     });
-    expect(near.installments[3].paidAmount).toBe(656_250);
-    expect(near.installments[2].paidAmount).toBe(0);
+    expect(near.installments[2].paidAmount).toBe(656_250);
+    expect(near.installments[2].status).toBe("PAID");
+    expect(near.installments[3].paidAmount).toBe(0);
     expectGateStateReconciles(near);
   });
 

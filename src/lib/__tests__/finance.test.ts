@@ -24,10 +24,10 @@ const INSTALLMENTS = [
 ];
 
 const PAYMENTS = [
-  { amount: 2_900_000, paymentDate: new Date("2026-09-15T10:00:00Z"), status: "CONFIRMED", installmentId: "i0", transactionId: "t1" },
-  { amount: 1_450_000, paymentDate: new Date("2026-09-20T10:00:00Z"), status: "PENDING_VERIFICATION", installmentId: "i1", transactionId: "t1" },
-  { amount: 2_900_000, paymentDate: new Date("2026-09-16T10:00:00Z"), status: "CANCELLED", installmentId: "i0", transactionId: "t1" },
-  { amount: 10_000_000, paymentDate: new Date("2026-09-15T10:00:00Z"), status: "CONFIRMED", installmentId: "ix", transactionId: "tX" },
+  { id: "p1", amount: 2_900_000, paymentDate: new Date("2026-09-15T10:00:00Z"), status: "CONFIRMED", installmentId: "i0", transactionId: "t1" },
+  { id: "p2", amount: 1_450_000, paymentDate: new Date("2026-09-20T10:00:00Z"), status: "PENDING_VERIFICATION", installmentId: "i1", transactionId: "t1" },
+  { id: "p3", amount: 2_900_000, paymentDate: new Date("2026-09-16T10:00:00Z"), status: "CANCELLED", installmentId: "i0", transactionId: "t1" },
+  { id: "px", amount: 10_000_000, paymentDate: new Date("2026-09-15T10:00:00Z"), status: "CONFIRMED", installmentId: "ix", transactionId: "tX" },
 ];
 
 type Where = {

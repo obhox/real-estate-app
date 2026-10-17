@@ -1,6 +1,17 @@
 import { prisma } from "@/lib/prisma";
 import { deriveInstallmentStatus } from "@/lib/paymentConfirmation";
 import { lagosDayKey, startOfTodayLagos } from "@/lib/time";
+import {
+  deriveInstallmentViews,
+  replayAllocation,
+  toDisplayStatus,
+  type AllocationInstallment,
+  type FinanceInstallmentStatus,
+  type InstallmentView,
+} from "./allocations";
+
+export { toDisplayStatus };
+export type { FinanceInstallmentStatus, InstallmentView };
 
 // Single source of truth for every financial figure in the app
 // (AGENTS.md rule 3). Pages and API routes must call these functions —
@@ -15,27 +26,6 @@ import { lagosDayKey, startOfTodayLagos } from "@/lib/time";
 // - Installment display status derives from confirmed money:
 //   Paid (>= scheduled) → Late (past due, not fully paid) → Partial
 //   (0 < paid < scheduled) → Pending.
-
-export type FinanceInstallmentStatus = "Paid" | "Late" | "Partial" | "Pending";
-
-export function toDisplayStatus(confirmedPaid: number, scheduledAmount: number, dueDate: Date, now: Date = new Date()): FinanceInstallmentStatus {
-  if (confirmedPaid >= scheduledAmount) return "Paid";
-  if (dueDate < now) return "Late";
-  if (confirmedPaid > 0) return "Partial";
-  return "Pending";
-}
-
-export type InstallmentView = {
-  id: string;
-  installmentNumber: number;
-  type: string;
-  dueDate: Date;
-  scheduledAmount: number;
-  confirmedPaid: number;
-  pendingTotal: number;
-  status: FinanceInstallmentStatus;
-  overdue: boolean;
-};
 
 export type TransactionSummary = {
   id: string;
@@ -59,7 +49,7 @@ export type FinanceDb = {
     aggregate(args: unknown): Promise<{ _sum: { amount: number | null } }>;
     count(args: unknown): Promise<number>;
     findMany(args: unknown): Promise<
-      { amount: number; paymentDate: Date; status: string; installmentId: string | null; transactionId: string }[]
+      { id: string; amount: number; paymentDate: Date; status: string; installmentId: string | null; transactionId: string }[]
     >;
   };
   installment: {
@@ -109,20 +99,32 @@ export async function getOverdueInstallments(
     where: {
       ...(opts.includeTest ? {} : { transaction: { isTest: false } }),
       dueDate: { lt: now },
-      status: { notIn: ["PAID", "WAIVED"] },
+      status: { notIn: ["WAIVED"] },
     },
     orderBy: { dueDate: "asc" },
   });
-  // Confirm against money, not just the stored label: an installment whose
-  // confirmed payments already cover the schedule is not overdue even if its
-  // stored status lags (reconcile-installments.ts fixes the label).
+  if (rows.length === 0) return [];
+  // Confirm against money, not the stored label: per-installment paid is the
+  // waterfall replay of the transaction's confirmed payments, so an
+  // installment whose schedule is genuinely covered is never overdue even if
+  // its stored status lags.
   const payments = await db.payment.findMany({
-    where: { status: "CONFIRMED", installmentId: { in: rows.map((r) => r.id) } },
-    select: { amount: true, installmentId: true },
+    where: { status: "CONFIRMED", transactionId: { in: [...new Set(rows.map((r) => r.transactionId))] } },
+    select: { id: true, amount: true, paymentDate: true, status: true, installmentId: true, transactionId: true },
   });
+  const instByTxn = new Map<string, AllocationInstallment[]>();
+  for (const r of rows) {
+    const list = instByTxn.get(r.transactionId) ?? [];
+    list.push({ id: r.id, installmentNumber: r.installmentNumber, type: r.type, dueDate: new Date(r.dueDate), scheduledAmount: r.scheduledAmount });
+    instByTxn.set(r.transactionId, list);
+  }
   const paidByInst = new Map<string, number>();
-  for (const p of payments) {
-    if (p.installmentId) paidByInst.set(p.installmentId, (paidByInst.get(p.installmentId) ?? 0) + p.amount);
+  for (const [txnId, insts] of instByTxn) {
+    const { installments: allocated } = replayAllocation(
+      insts,
+      payments.filter((p) => p.transactionId === txnId)
+    );
+    for (const a of allocated) paidByInst.set(a.id, a.confirmedPaid);
   }
   return rows
     .map((r) => ({ ...r, confirmedPaid: paidByInst.get(r.id) ?? 0 }))
@@ -143,43 +145,38 @@ export async function getTransactionSummary(
   if (txn.isTest && !opts.includeTest) return null;
   const payments = await db.payment.findMany({
     where: { transactionId, status: { in: ["CONFIRMED", "PENDING_VERIFICATION"] } },
-    select: { amount: true, status: true, installmentId: true },
+    select: { id: true, amount: true, status: true, installmentId: true, paymentDate: true },
   });
-  const confirmedByInst = new Map<string, number>();
   const pendingByInst = new Map<string, number>();
   let confirmedPaid = 0;
-  let unlinkedConfirmed = 0;
   for (const p of payments) {
-    if (p.status === "CONFIRMED") {
-      confirmedPaid += p.amount;
-      if (p.installmentId) confirmedByInst.set(p.installmentId, (confirmedByInst.get(p.installmentId) ?? 0) + p.amount);
-      else unlinkedConfirmed += p.amount;
-    } else if (p.installmentId) {
-      pendingByInst.set(p.installmentId, (pendingByInst.get(p.installmentId) ?? 0) + p.amount);
-    }
+    if (p.status === "CONFIRMED") confirmedPaid += p.amount;
+    else if (p.installmentId) pendingByInst.set(p.installmentId, (pendingByInst.get(p.installmentId) ?? 0) + p.amount);
   }
-  const installments: InstallmentView[] = txn.installments.map((i) => {
-    const paid = confirmedByInst.get(i.id) ?? 0;
-    const status = toDisplayStatus(paid, i.scheduledAmount, new Date(i.dueDate), now);
-    return {
+  // Per-installment paid is the waterfall replay of this transaction's
+  // confirmed payments — the same rule the schedule, next-due, overdue lists,
+  // receipts and statements read. The Payment.installmentId pointer never
+  // moves a money figure; it only hints which row shows a pending payment.
+  const { views, credit } = deriveInstallmentViews(
+    txn.installments.map((i) => ({
       id: i.id,
       installmentNumber: i.installmentNumber,
       type: i.type,
       dueDate: new Date(i.dueDate),
       scheduledAmount: i.scheduledAmount,
-      confirmedPaid: paid,
-      pendingTotal: pendingByInst.get(i.id) ?? 0,
-      status,
-      overdue: status === "Late",
-    };
-  });
+    })),
+    payments.map((p) => ({ id: p.id, amount: p.amount, paymentDate: new Date(p.paymentDate), status: p.status })),
+    now,
+    pendingByInst
+  );
+  const installments = views;
   // Totals, next-due and overdue derive from the shared helper so every
-  // surface agrees (per-installment display labels above stay for the
-  // schedule UI, which shows each row's own state).
+  // surface agrees. Every confirmed naira is allocated or held as credit, so
+  // totalPaid stays exactly the sum of confirmed payments.
   const fin = getTransactionFinancials(
     {
       totalPayable: txn.totalPayable,
-      unlinkedConfirmed,
+      unlinkedConfirmed: credit,
       installments: installments.map((i) => ({
         installmentNumber: i.installmentNumber,
         type: i.type,
@@ -347,28 +344,44 @@ export async function getTransactionOverviews(
     db.installment.findMany({ where: { transactionId: { in: transactionIds } } }),
     db.payment.findMany({ where: { transactionId: { in: transactionIds }, status: "CONFIRMED" } }),
   ]);
-  const paidByInst = new Map<string, number>();
-  const unlinkedByTxn = new Map<string, number>();
-  for (const p of payments) {
-    if (p.installmentId) paidByInst.set(p.installmentId, (paidByInst.get(p.installmentId) ?? 0) + p.amount);
-    else unlinkedByTxn.set(p.transactionId, (unlinkedByTxn.get(p.transactionId) ?? 0) + p.amount);
-  }
-  const instByTxn = new Map<string, FinancialInstallmentInput[]>();
+  const instByTxn = new Map<string, AllocationInstallment[]>();
   for (const i of installments) {
     if (i.status === "WAIVED") continue;
     const list = instByTxn.get(i.transactionId) ?? [];
     list.push({
+      id: i.id,
       installmentNumber: i.installmentNumber,
       type: i.type,
       dueDate: new Date(i.dueDate),
       scheduledAmount: i.scheduledAmount,
-      confirmedPaid: paidByInst.get(i.id) ?? 0,
     });
     instByTxn.set(i.transactionId, list);
   }
+  const payByTxn = new Map<string, typeof payments>();
+  for (const p of payments) {
+    const list = payByTxn.get(p.transactionId) ?? [];
+    list.push(p);
+    payByTxn.set(p.transactionId, list);
+  }
   for (const t of txns) {
+    // Same waterfall replay as getTransactionSummary, so list rows and the
+    // detail page can never disagree.
+    const { installments: allocated, credit } = replayAllocation(
+      instByTxn.get(t.id) ?? [],
+      payByTxn.get(t.id) ?? []
+    );
     const fin = getTransactionFinancials(
-      { totalPayable: t.totalPayable, unlinkedConfirmed: unlinkedByTxn.get(t.id) ?? 0, installments: instByTxn.get(t.id) ?? [] },
+      {
+        totalPayable: t.totalPayable,
+        unlinkedConfirmed: credit,
+        installments: allocated.map((a) => ({
+          installmentNumber: a.installmentNumber,
+          type: a.type,
+          dueDate: a.dueDate,
+          scheduledAmount: a.scheduledAmount,
+          confirmedPaid: a.confirmedPaid,
+        })),
+      },
       now
     );
     out.set(t.id, {
