@@ -38,12 +38,12 @@ export default async function ClientStatementPage({ params }: { params: Promise<
       transaction: { select: { ref: true, customerName: true, customerEmail: true } },
     },
   });
-  if (!stmt || stmt.tokenRevokedAt) {
+  if (!stmt || stmt.tokenRevokedAt || stmt.kind !== "LEDGER") {
     notFound();
   }
 
   const newer = await prisma.statement.findFirst({
-    where: { transactionId: stmt.transactionId, createdAt: { gt: stmt.createdAt } },
+    where: { transactionId: stmt.transactionId, kind: "LEDGER", createdAt: { gt: stmt.createdAt } },
     orderBy: { createdAt: "desc" },
     select: { token: true, number: true, asAt: true },
   });

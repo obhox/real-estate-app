@@ -612,6 +612,11 @@ model Statement {
   pdfData Bytes
   closingBalance Int
   ledgerHash String
+  // LEDGER = the staff/internal Statement of Account (ledger order).
+  // SCHEDULE = the client-facing Schedule Statement (one row per installment).
+  // The two share the issue/token/serve/email lifecycle but never the same
+  // dedupe key, so a schedule issue can never return a ledger statement.
+  kind String @default("LEDGER")
   asAt DateTime @default(now())
   // Statement template build: as-of date, renderer version and PDF integrity.
   // Nullable so pre-existing rows stay valid. pdfData bytes remain the private
@@ -628,6 +633,7 @@ model Statement {
 
   @@index([transactionId])
   @@index([transactionId, ledgerHash])
+  @@index([transactionId, kind, ledgerHash])
 }
 
 // Immutable audit trail for payment/transaction/receipt mutations.

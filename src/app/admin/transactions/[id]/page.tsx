@@ -19,6 +19,7 @@ import CorrectPaymentDialog from "./CorrectPaymentDialog";
 import ReconcileButton from "./ReconcileButton";
 import CorrectionsPanel from "./CorrectionsPanel";
 import StatementsPanel from "./StatementsPanel";
+import ScheduleStatementPanel from "./ScheduleStatementPanel";
 import TruncatedNote from "./TruncatedNote";
 import { buildStatementRows } from "@/lib/statement";
 import { buildStatementModel } from "@/lib/statement-model";
@@ -274,10 +275,13 @@ export default async function TransactionDetailPage({
                 status: p.status,
                 isCredit: p.isCredit ?? false,
                 creditAmount: p.creditAmount ?? null,
+                allocations: (p.allocations ?? []).map((a: { installmentId: string; amount: number }) => ({ installmentId: a.installmentId, amount: a.amount })),
               }))}
               receipts={transaction.receipts.map((r: any) => ({ id: r.id, paymentId: r.paymentId }))}
               outstanding={outstanding}
               totals={{ totalPaid, totalPayable: transaction.totalPayable }}
+              contractDate={transaction.contractDate ? new Date(transaction.contractDate).toISOString() : null}
+              existingReferences={effectivePayments.flatMap((p) => (p.bankReference ? [p.bankReference] : []))}
             /></div>
             <div className="card">
               <div className="card-h"><h3>Latest payments</h3><Link href={`/admin/transactions/${transaction.id}?tab=payments`} className="lnk">All {effectivePayments.length} →</Link></div>
@@ -421,11 +425,24 @@ export default async function TransactionDetailPage({
             <StatementsPanel
               transactionId={transaction.id}
               transactionRef={transaction.ref}
-              statements={transaction.statements.map((s: any) => ({
+              statements={transaction.statements.filter((s: any) => s.kind !== "SCHEDULE").map((s: any) => ({
                 id: s.id,
                 number: s.number,
                 asAt: formatDate(s.asAt),
                 closingBalance: s.closingBalance,
+                emailed: s.emailSentAt ? { at: formatDateTime(s.emailSentAt), to: s.emailRecipient ?? "-" } : null,
+                defaultTo: transaction.customerEmail,
+              }))}
+            />
+
+            <ScheduleStatementPanel
+              transactionId={transaction.id}
+              transactionRef={transaction.ref}
+              statements={transaction.statements.filter((s: any) => s.kind === "SCHEDULE").map((s: any) => ({
+                id: s.id,
+                number: s.number,
+                asAt: formatDate(s.asAt),
+                outstanding: s.closingBalance,
                 emailed: s.emailSentAt ? { at: formatDateTime(s.emailSentAt), to: s.emailRecipient ?? "-" } : null,
                 defaultTo: transaction.customerEmail,
               }))}

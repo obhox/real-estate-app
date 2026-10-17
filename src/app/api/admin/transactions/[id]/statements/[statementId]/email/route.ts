@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { auth } from "@/auth";
 import { isInternalRole } from "@/lib/authz";
-import { statementVerifyUrl } from "@/lib/statements";
+import { statementVerifyUrl, scheduleStatementVerifyUrl } from "@/lib/statements";
 import { formatDisplayName } from "@/lib/formatName";
 import { formatSignedNaira } from "@/lib/currency";
 import { logServerError } from "@/lib/paymentConfirmation";
@@ -38,13 +38,20 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   });
   if (!stmt) return NextResponse.json({ error: "Statement not found" }, { status: 404 });
 
-  const subject = `Your statement of account, ${stmt.transaction.ref}`;
+  const isSchedule = stmt.kind === "SCHEDULE";
+  const viewUrl = isSchedule ? scheduleStatementVerifyUrl(stmt.token) : statementVerifyUrl(stmt.token);
+  const subject = isSchedule
+    ? `Your payment schedule, ${stmt.transaction.ref}`
+    : `Your statement of account, ${stmt.transaction.ref}`;
   const html =
     `<p>Hi ${formatDisplayName(stmt.transaction.customerName)},</p>` +
-    `<p>Your statement of account <strong>${stmt.number}</strong> is attached as PDF. ` +
-    `Outstanding balance as at the statement date: <strong>${formatSignedNaira(stmt.closingBalance)}</strong>.</p>` +
+    (isSchedule
+      ? `<p>Your payment schedule <strong>${stmt.number}</strong> is attached as PDF. ` +
+        `Outstanding balance: <strong>${formatSignedNaira(stmt.closingBalance)}</strong>.</p>`
+      : `<p>Your statement of account <strong>${stmt.number}</strong> is attached as PDF. ` +
+        `Outstanding balance as at the statement date: <strong>${formatSignedNaira(stmt.closingBalance)}</strong>.</p>`) +
     (note ? `<p>${note.replace(/</g, "&lt;")}</p>` : "") +
-    `<p>You can also view or re-download it anytime at:<br/><a href="${statementVerifyUrl(stmt.token)}">${statementVerifyUrl(stmt.token)}</a></p>` +
+    `<p>You can also view or re-download it anytime at:<br/><a href="${viewUrl}">${viewUrl}</a></p>` +
     `<p>Belgrove Homes and Properties Limited<br/>www.belgrovehomes.com · info@belgrovehomes.com · +234 8103760063</p>`;
 
   const { sendEmail } = await import("@/lib/email/sendEmail");
