@@ -35,11 +35,14 @@ export type TransactionSummary = {
   outstanding: number;
   progressPct: number;
   overdueCount: number;
+  overdueAmount: number;
   nextInstallment: NextInstallmentDue | null;
   isOverdue: boolean;
   daysUntilDue: number | null;
   daysOverdue: number | null;
   isFullyPaid: boolean;
+  isOverpaid: boolean;
+  overpaidAmount: number;
   installments: InstallmentView[];
 };
 
@@ -104,29 +107,63 @@ export async function getOverdueInstallments(
     orderBy: { dueDate: "asc" },
   });
   if (rows.length === 0) return [];
-  // Confirm against money, not the stored label: per-installment paid is the
-  // waterfall replay of the transaction's confirmed payments, so an
-  // installment whose schedule is genuinely covered is never overdue even if
-  // its stored status lags.
-  const payments = await db.payment.findMany({
-    where: { status: "CONFIRMED", transactionId: { in: [...new Set(rows.map((r) => r.transactionId))] } },
-    select: { id: true, amount: true, paymentDate: true, status: true, installmentId: true, transactionId: true },
-  });
+  const txnIds = [...new Set(rows.map((r) => r.transactionId))];
+  const testFilter = opts.includeTest ? {} : { transaction: { isTest: false } };
+  const txnTestFilter = opts.includeTest ? {} : { isTest: false };
+  // Every installment of the candidate transactions (not just the past-due
+  // ones) and the confirmed money, so the overdue verdict is the same
+  // balance-first one getTransactionFinancials gives every other surface.
+  const [allInst, payments, txns] = await Promise.all([
+    db.installment.findMany({
+      where: { transactionId: { in: txnIds }, status: { notIn: ["WAIVED"] }, ...testFilter },
+    }),
+    db.payment.findMany({
+      where: { status: "CONFIRMED", transactionId: { in: txnIds } },
+      select: { id: true, amount: true, paymentDate: true, status: true, installmentId: true, transactionId: true },
+    }),
+    db.transaction.findMany({ where: { id: { in: txnIds }, ...txnTestFilter }, select: { id: true, totalPayable: true } }),
+  ]);
+  const totalByTxn = new Map(txns.map((t) => [t.id, t.totalPayable]));
   const instByTxn = new Map<string, AllocationInstallment[]>();
-  for (const r of rows) {
+  for (const r of allInst) {
     const list = instByTxn.get(r.transactionId) ?? [];
     list.push({ id: r.id, installmentNumber: r.installmentNumber, type: r.type, dueDate: new Date(r.dueDate), scheduledAmount: r.scheduledAmount });
     instByTxn.set(r.transactionId, list);
   }
+  // Per-installment paid is the waterfall replay of the transaction's
+  // confirmed payments; a transaction only contributes overdue rows when its
+  // balance-first overdueAmount is positive, so a settled transaction whose
+  // schedule happens to leave a past-due row short can never show as overdue.
   const paidByInst = new Map<string, number>();
-  for (const [txnId, insts] of instByTxn) {
-    const { installments: allocated } = replayAllocation(
+  const overdueTxn = new Set<string>();
+  for (const txnId of txnIds) {
+    const insts = instByTxn.get(txnId) ?? [];
+    const { installments: allocated, credit } = replayAllocation(
       insts,
       payments.filter((p) => p.transactionId === txnId)
     );
     for (const a of allocated) paidByInst.set(a.id, a.confirmedPaid);
+    // A missing totalPayable row should not happen; fall back to the schedule
+    // sum (previous behaviour) rather than hide overdue money.
+    const totalPayable = totalByTxn.get(txnId) ?? allocated.reduce((s, a) => s + a.scheduledAmount, 0);
+    const fin = getTransactionFinancials(
+      {
+        totalPayable,
+        unlinkedConfirmed: credit,
+        installments: allocated.map((a) => ({
+          installmentNumber: a.installmentNumber,
+          type: a.type,
+          dueDate: a.dueDate,
+          scheduledAmount: a.scheduledAmount,
+          confirmedPaid: a.confirmedPaid,
+        })),
+      },
+      now
+    );
+    if (fin.overdueAmount > 0) overdueTxn.add(txnId);
   }
   return rows
+    .filter((r) => overdueTxn.has(r.transactionId))
     .map((r) => ({ ...r, confirmedPaid: paidByInst.get(r.id) ?? 0 }))
     .filter((r) => r.confirmedPaid < r.scheduledAmount);
 }
@@ -158,13 +195,17 @@ export async function getTransactionSummary(
   // receipts and statements read. The Payment.installmentId pointer never
   // moves a money figure; it only hints which row shows a pending payment.
   const { views, credit } = deriveInstallmentViews(
-    txn.installments.map((i) => ({
-      id: i.id,
-      installmentNumber: i.installmentNumber,
-      type: i.type,
-      dueDate: new Date(i.dueDate),
-      scheduledAmount: i.scheduledAmount,
-    })),
+    txn.installments
+      // Waived installments are not owed: drop them so the schedule, next-due
+      // and overdue agree with getTransactionOverviews (which filters WAIVED).
+      .filter((i) => i.status !== "WAIVED")
+      .map((i) => ({
+        id: i.id,
+        installmentNumber: i.installmentNumber,
+        type: i.type,
+        dueDate: new Date(i.dueDate),
+        scheduledAmount: i.scheduledAmount,
+      })),
     payments.map((p) => ({ id: p.id, amount: p.amount, paymentDate: new Date(p.paymentDate), status: p.status })),
     now,
     pendingByInst
@@ -195,11 +236,14 @@ export async function getTransactionSummary(
     outstanding: fin.outstanding,
     progressPct: fin.progressPct,
     overdueCount: fin.overdueCount,
+    overdueAmount: fin.overdueAmount,
     nextInstallment: fin.nextInstallment,
     isOverdue: fin.isOverdue,
     daysUntilDue: fin.daysUntilDue,
     daysOverdue: fin.daysOverdue,
     isFullyPaid: fin.isFullyPaid,
+    isOverpaid: fin.isOverpaid,
+    overpaidAmount: fin.overpaidAmount,
     installments,
   };
 }
@@ -237,16 +281,25 @@ export type NextInstallmentDue = {
 export type TransactionFinancials = {
   totalPayable: number;
   totalPaid: number;
+  // totalPayable - totalPaid. Negative only when overpaid.
   outstanding: number;
   progressPct: number;
   nextInstallment: NextInstallmentDue | null;
   overdueCount: number;
+  // Overdue money: scheduled naira past its due date that confirmed payments
+  // have not covered. Zero whenever the balance is settled, by construction.
+  overdueAmount: number;
   isOverdue: boolean;
   // Calendar-day distance (Lagos) from today to the next due date.
   // Exactly one is non-null when a next installment exists.
   daysUntilDue: number | null;
   daysOverdue: number | null;
   isFullyPaid: boolean;
+  isOverpaid: boolean;
+  overpaidAmount: number;
+  // Balance still owed but no scheduled installment left to cover it — a
+  // schedule/contract mismatch worth surfacing to ops (never rendered red).
+  scheduleDeficit: boolean;
 };
 
 function dayKeyDiff(fromKey: string, toKey: string): number {
@@ -263,19 +316,53 @@ export function getTransactionFinancials(
   const totalPaid = ordered.reduce((s, i) => s + i.confirmedPaid, 0) + (txn.unlinkedConfirmed ?? 0);
   const outstanding = txn.totalPayable - totalPaid;
   const todayKey = lagosDayKey(now);
+  const progressPct = txn.totalPayable > 0 ? Math.round((totalPaid / txn.totalPayable) * 10000) / 100 : 0;
+  const isOverpaid = outstanding < 0;
+  const overpaidAmount = isOverpaid ? -outstanding : 0;
 
-  // Unlinked confirmed money covers the earliest dues first.
+  // Balance-first: once the balance is settled the transaction is Paid in
+  // full — no next due, no overdue, never red — no matter what the schedule
+  // rows say. This is what makes a schedule whose rows don't sum to the
+  // contract (deficit or surplus) structurally unable to read "Behind".
+  if (outstanding <= 0) {
+    return {
+      totalPayable: txn.totalPayable,
+      totalPaid,
+      outstanding,
+      progressPct,
+      nextInstallment: null,
+      overdueCount: 0,
+      overdueAmount: 0,
+      isOverdue: false,
+      daysUntilDue: null,
+      daysOverdue: null,
+      isFullyPaid: true,
+      isOverpaid,
+      overpaidAmount,
+      scheduleDeficit: false,
+    };
+  }
+
+  // Money is still owed. Walk the schedule in order, rolling unlinked
+  // confirmed money and any excess on one installment forward as cover for the
+  // next (the same carry-forward the confirmation waterfall applies).
   let carry = txn.unlinkedConfirmed ?? 0;
+  let scheduledTotal = 0;
   let nextInstallment: NextInstallmentDue | null = null;
   let overdueCount = 0;
+  let overdueAmount = 0;
   for (const i of ordered) {
+    scheduledTotal += i.scheduledAmount;
     const due = Math.max(0, i.scheduledAmount - i.confirmedPaid - carry);
     carry = Math.max(0, i.confirmedPaid + carry - i.scheduledAmount);
     if (due <= 0) continue;
     if (!nextInstallment) {
       nextInstallment = { number: i.installmentNumber, type: i.type, amountDue: due, dueDate: new Date(i.dueDate) };
     }
-    if (lagosDayKey(i.dueDate) < todayKey) overdueCount += 1;
+    if (lagosDayKey(i.dueDate) < todayKey) {
+      overdueCount += 1;
+      overdueAmount += due;
+    }
   }
 
   let daysUntilDue: number | null = null;
@@ -285,18 +372,22 @@ export function getTransactionFinancials(
     if (diff < 0) daysOverdue = -diff;
     else daysUntilDue = diff;
   }
-  const isFullyPaid = outstanding <= 0 && !nextInstallment;
   return {
     totalPayable: txn.totalPayable,
     totalPaid,
     outstanding,
-    progressPct: txn.totalPayable > 0 ? Math.round((totalPaid / txn.totalPayable) * 10000) / 100 : 0,
+    progressPct,
     nextInstallment,
     overdueCount,
-    isOverdue: overdueCount > 0,
+    overdueAmount,
+    // Overdue is driven by money past due, not by any stored label.
+    isOverdue: overdueAmount > 0,
     daysUntilDue,
     daysOverdue,
-    isFullyPaid,
+    isFullyPaid: false,
+    isOverpaid,
+    overpaidAmount,
+    scheduleDeficit: scheduledTotal < txn.totalPayable,
   };
 }
 
@@ -322,11 +413,15 @@ export type TransactionOverview = {
   confirmedPaid: number;
   outstanding: number;
   overdueCount: number;
+  overdueAmount: number;
   nextInstallment: NextInstallmentDue | null;
   isOverdue: boolean;
   daysUntilDue: number | null;
   daysOverdue: number | null;
   isFullyPaid: boolean;
+  isOverpaid: boolean;
+  overpaidAmount: number;
+  scheduleDeficit: boolean;
 };
 
 // Batch per-transaction money for list views (one query set, no N+1, no
@@ -389,11 +484,15 @@ export async function getTransactionOverviews(
       confirmedPaid: fin.totalPaid,
       outstanding: fin.outstanding,
       overdueCount: fin.overdueCount,
+      overdueAmount: fin.overdueAmount,
       nextInstallment: fin.nextInstallment,
       isOverdue: fin.isOverdue,
       daysUntilDue: fin.daysUntilDue,
       daysOverdue: fin.daysOverdue,
       isFullyPaid: fin.isFullyPaid,
+      isOverpaid: fin.isOverpaid,
+      overpaidAmount: fin.overpaidAmount,
+      scheduleDeficit: fin.scheduleDeficit,
     });
   }
   return out;

@@ -100,7 +100,6 @@ async function main() {
       totalPaidAfter: previouslyPaid + r.payment.amount,
       outstandingBalance: txn.totalPayable - previouslyPaid - r.payment.amount,
       transactionRef: txn.ref,
-      installmentLabel,
     });
     await writeReceiptPdf(pdfPath, pdfBuffer);
     await prisma.receipt.update({

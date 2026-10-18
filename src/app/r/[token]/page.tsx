@@ -2,8 +2,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { formatNaira } from "@/lib/currency";
 import { formatDisplayName } from "@/lib/formatName";
-import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
-import { getAllocationLabelParts } from "@/lib/finance/ledger";
+import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy } from "@/lib/receipt-amounts";
 import { isTokenUsable } from "@/lib/receipt-access";
 import { formatDateDMY } from "@/lib/time";
 
@@ -44,19 +43,8 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
     notFound();
   }
 
-  // Allocation-derived label (waterfall rows), never the payment's single
-  // installment link — a payment can span installments. Pre-backfill rows
-  // without allocation rows keep the old installment-link label.
-  const allocParts = receipt.payment
-    ? await getAllocationLabelParts(prisma, receipt.payment.id).catch(() => [])
-    : [];
-  const installmentLabel = allocParts.length > 0
-    ? appliedToLabel(allocParts)
-    : receipt.payment?.installment
-      ? receipt.payment.installment.type === "INITIAL"
-        ? "Initial payment"
-        : `Month ${receipt.payment.installment.installmentNumber} payment`
-      : null;
+  // A receipt shows only what was paid — no schedule, no per-installment
+  // "applied to" line (that lives on the client statement).
   const clientPayment = receipt.payment;
   const confirmedList = [...(receipt.transaction?.payments ?? [])];
   if (clientPayment && !confirmedList.some((p) => p.id === clientPayment.id)) {
@@ -137,7 +125,6 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
             <div className="bg-[#C79A46] rounded-lg p-4 text-white">
               {receiptAmountsRows({
                 thisPayment: receipt.finalAmount,
-                installmentLabel,
                 totalPrice,
                 interestAmount: receipt.transaction?.interestAmount ?? null,
                 paidToDate,
@@ -157,7 +144,6 @@ export default async function ClientReceiptPage({ params }: { params: Promise<{ 
           </div>
 
           <div className="mono text-[11px] font-bold text-[#16281F] mt-6 break-words">{receipt.property}</div>
-          {installmentLabel && <div className="mono text-[11px] text-[#6B6656] mt-1">{installmentLabel}</div>}
           <div className="mono text-[11px] text-[#6B6656] mt-1">
             {clientPayment?.paymentMethod ?? receipt.paymentMethod ?? "Bank Transfer"}
             {clientPayment?.bankReference ? ` · Bank ref: ${clientPayment.bankReference}` : ""}

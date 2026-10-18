@@ -2,8 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { generateReceiptPdf } from "@/lib/receipts/generateReceiptPdf";
 import { generateQrDataUrl } from "@/lib/receipts/qr";
 import { getReceiptAccessUrl } from "@/lib/app-url";
-import { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
-import { getAllocationLabelParts } from "@/lib/finance/ledger";
+import { buildReceiptHistory, buildAccountRef, settlementCopy } from "@/lib/receipt-amounts";
 import { formatDateDMY } from "@/lib/time";
 
 
@@ -98,9 +97,6 @@ export async function renderReceiptPdfBuffer(receiptId: string, opts?: { force?:
     settledOn: receipt.payment?.paymentDate ?? receipt.issuedAt,
     formatDate: formatDateDMY,
   });
-  // Allocation-derived label (see receipt-amounts); pre-backfill rows without
-  // allocation rows keep the old installment-link label.
-  const allocParts = await getAllocationLabelParts(prisma, receipt.payment.id).catch(() => []);
 
   return generateReceiptPdf({
     ref: receipt.ref,
@@ -134,12 +130,5 @@ export async function renderReceiptPdfBuffer(receiptId: string, opts?: { force?:
     previouslyPaid,
     totalPaidAfter: previouslyPaid + receipt.finalAmount,
     outstandingBalance: balanceAfter,
-    installmentLabel: allocParts.length > 0
-      ? appliedToLabel(allocParts)
-      : receipt.payment?.installment
-        ? receipt.payment.installment.type === "INITIAL"
-          ? "Initial payment"
-          : `Month ${receipt.payment.installment.installmentNumber} payment`
-        : undefined,
   });
 }

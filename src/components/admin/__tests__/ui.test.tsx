@@ -69,10 +69,9 @@ describe("receipt amounts wording", () => {
     expect(describePayment(null, { estate: "Estate" })).toBe("Initial payment: Estate");
   });
 
-  it("amounts block uses the shared order with no legacy labels", () => {
+  it("amounts block uses the shared order with no installment or legacy labels", () => {
     const rows = receiptAmountsRows({
       thisPayment: 2_905_000,
-      installmentLabel: "Initial payment",
       totalPrice: 8_300_000,
       paidToDate: 2_905_000,
       balanceRemaining: 5_395_000,
@@ -80,13 +79,12 @@ describe("receipt amounts wording", () => {
     });
     expect(rows.map((r) => r.label)).toEqual([
       "This payment",
-      "Installment",
       "Total price",
       "Paid to date",
       "Balance remaining",
     ]);
     for (const r of rows) {
-      expect(r.label).not.toMatch(/amount before discount|final amount paid/i);
+      expect(r.label).not.toMatch(/installment|amount before discount|final amount paid/i);
     }
   });
 });

@@ -60,10 +60,9 @@ export type ReceiptData = {
   totalPaidAfter?: number;
   outstandingBalance?: number;
   transactionRef?: string;
-  installmentLabel?: string;
   // Client-facing settlement sentence shown when the plan is fully paid
-  // (from settlementCopy) — e.g. "Plan fully paid on 14 Mar 2027, 2 months
-  // ahead of schedule. No further payments due."
+  // (from settlementCopy) — e.g. "Plan fully paid on 14 Mar 2027. No further
+  // payments due."
   settlementNote?: string | null;
 };
 
@@ -247,11 +246,10 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
     doc.setTextColor(80, 80, 80);
     const details: [string, string][] = [];
     // Same amounts layout and wording as the admin receipt page and the
-    // client receipt (This payment → Installment → Total price → Interest →
-    // Paid to date → Balance remaining, Discount only when > 0).
+    // client receipt (This payment → Total price → Interest → Paid to date →
+    // Balance remaining, Discount only when > 0).
     for (const row of receiptAmountsRows({
       thisPayment: data.amountPaid,
-      installmentLabel: ext.installmentLabel ?? null,
       totalPrice: ext.totalPayable ?? data.soldPrice,
       interestAmount: ext.interestAmount ?? null,
       paidToDate: ext.totalPaidAfter ?? data.amountPaid,

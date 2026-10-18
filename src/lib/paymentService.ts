@@ -98,8 +98,7 @@ export async function recordPaymentAndGenerateReceipt(params: {
     receiptId: confirmed.receiptId,
     ref: receiptRef,
     render: async () => {
-      const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
-      const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
+      const { buildReceiptHistory, buildAccountRef, settlementCopy } = await import("@/lib/receipt-amounts");
       const fullTxn = await prisma.transaction.findUnique({
         where: { id: transaction.id },
         select: { bookingId: true },
@@ -124,15 +123,6 @@ export async function recordPaymentAndGenerateReceipt(params: {
         formatDateDMY
       );
       const saved = await prisma.payment.findUnique({ where: { id: confirmed.payment.id }, select: { bankReference: true } });
-      const allocParts = await getAllocationLabelParts(prisma, confirmed.payment.id).catch(() => []);
-      const installmentLabel =
-        allocParts.length > 0
-          ? appliedToLabel(allocParts)
-          : confirmed.installment
-            ? confirmed.installment.type === "INITIAL"
-              ? "Initial payment"
-              : `Month ${confirmed.installment.installmentNumber} payment`
-            : undefined;
       const settlement = settlementCopy({
         balanceAfter: confirmed.newOutstanding,
         settledOn: confirmed.payment.paymentDate,
@@ -171,7 +161,6 @@ export async function recordPaymentAndGenerateReceipt(params: {
         totalPaidAfter: confirmed.newTotalPaid,
         outstandingBalance: confirmed.newOutstanding,
         transactionRef: transaction.ref,
-        installmentLabel,
       });
     },
   });

@@ -8,7 +8,7 @@ import { prisma } from "@/lib/prisma";
 import { formatNaira } from "@/lib/currency";
 import { formatDisplayName } from "@/lib/formatName";
 import { formatDateTime } from "@/lib/booking-ui";
-import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } from "@/lib/receipt-amounts";
+import { receiptAmountsRows, buildReceiptHistory, buildAccountRef, settlementCopy } from "@/lib/receipt-amounts";
 import ActivitySection from "@/components/admin/ActivitySection";
 export const dynamic = "force-dynamic";
 import ReceiptActions from "./ReceiptActions";
@@ -73,17 +73,6 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
   });
   const label = settlement.headline;
   const accountRef = receipt.transaction ? buildAccountRef(receipt.transaction.ref, receipt.transaction.booking?.ref ?? null) : null;
-  // Allocation-derived "Applied to" (waterfall rows), never the payment's
-  // single installment link — a payment can span installments, which is why
-  // the old rigid "Initial payment"/"Month N payment" labels misled.
-  const allocParts = (receipt.payment as unknown as { allocations?: { amount: number; installment: { type: string; installmentNumber: number; scheduledAmount: number } }[] } | null)?.allocations ?? [];
-  const installmentLabel = allocParts.length > 0
-    ? appliedToLabel(allocParts.map((a) => ({ installmentNumber: a.installment.installmentNumber, type: a.installment.type, amount: a.amount, scheduledAmount: a.installment.scheduledAmount })))
-    : receipt.payment?.installment
-      ? receipt.payment.installment.type === "INITIAL"
-        ? "Initial payment"
-        : `Month ${receipt.payment.installment.installmentNumber} payment`
-      : null;
   // Plot quantity: receipt snapshot first, live transaction as fallback.
   const plotQty = receipt.plotQuantity ?? receipt.transaction?.plotQuantity ?? null;
   const unitPrice = receipt.unitPrice ?? receipt.transaction?.unitPrice ?? null;
@@ -136,7 +125,6 @@ export default async function ReceiptDetailPage({ params }: { params: Promise<{ 
               <div className="mt-3 space-y-2 text-sm">
                 {receiptAmountsRows({
                   thisPayment: receipt.finalAmount,
-                  installmentLabel,
                   totalPrice: receipt.transaction?.totalPayable ?? receipt.amountBeforeDiscount,
                   interestAmount: receipt.transaction?.interestAmount ?? null,
                   paidToDate,

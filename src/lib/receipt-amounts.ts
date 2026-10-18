@@ -1,14 +1,16 @@
 // Single source of truth for the receipt amounts block order and wording.
 // Used by the admin receipt page, the client receipt page, and the PDF
-// template so all three read: This payment · Installment · Total price ·
+// template so all three read: This payment · Total price · Interest ·
 // Paid to date · Balance remaining, with Discount only when > 0.
+//
+// Deliberately no per-installment line: a receipt is proof of a payment, not
+// a schedule. Which installment(s) a payment covered lives on the client
+// statement (schedule-statement) and the internal transaction view.
 import { formatNaira } from "./currency";
 
-// Installment display label for allocation-derived "Applied to" lines. THE
-// replacement for the old rigid schedule labels ("Initial payment" /
-// "Month 1" from the payment's single installment link): a payment can span
-// several installments via the waterfall, so labels always derive from the
-// allocation rows, never from payment.installment.
+// Installment display label ("Initial deposit" / "Month 1") for internal
+// views (transaction detail Payment History, statement). Not used on
+// receipts — see the note above.
 export function installmentAppliedLabel(installmentNumber: number, type: string): string {
   return type === "INITIAL" || installmentNumber === 0 ? "Initial deposit" : `Month ${installmentNumber}`;
 }
@@ -21,8 +23,8 @@ export type AppliedToPart = {
 };
 
 // "Initial deposit ₦250,000 of ₦9,250,000, Month 1 ₦2,750,000 of ₦3,083,333".
-// Shared by Payment History, receipt pages and new receipt PDFs so the three
-// can never describe one payment differently.
+// Shared by Payment History and the statement so the two can never describe
+// one payment differently. Not a receipt surface.
 export function appliedToLabel(parts: AppliedToPart[]): string {
   const ordered = [...parts].sort((a, b) => a.installmentNumber - b.installmentNumber);
   return ordered
@@ -31,7 +33,6 @@ export function appliedToLabel(parts: AppliedToPart[]): string {
 }
 export type ReceiptAmountsInput = {
   thisPayment: number;
-  installmentLabel?: string | null;
   totalPrice: number;
   // One-time plan interest, shown as a breakdown line under "Total price"
   // (never added again — totalPrice already includes it). Omitted when zero.
@@ -42,7 +43,7 @@ export type ReceiptAmountsInput = {
 };
 
 export type ReceiptAmountsRow = {
-  key: "this-payment" | "installment" | "total-price" | "interest" | "paid-to-date" | "balance" | "discount";
+  key: "this-payment" | "total-price" | "interest" | "paid-to-date" | "balance" | "discount";
   label: string;
   value: number | string;
   emphasize?: boolean;
@@ -52,9 +53,6 @@ export function receiptAmountsRows(input: ReceiptAmountsInput): ReceiptAmountsRo
   const rows: ReceiptAmountsRow[] = [
     { key: "this-payment", label: "This payment", value: input.thisPayment, emphasize: true },
   ];
-  if (input.installmentLabel) {
-    rows.push({ key: "installment", label: "Installment", value: input.installmentLabel });
-  }
   rows.push({ key: "total-price", label: "Total price", value: input.totalPrice });
   if ((input.interestAmount ?? 0) > 0) {
     rows.push({ key: "interest", label: "Interest", value: input.interestAmount as number });
@@ -76,7 +74,8 @@ export function settlementLabel(balanceAfter: number): SettlementLabel {
 }
 
 // Whole months from `from` up to `to` (calendar-month difference), floored at 0.
-// Used for the "N months ahead of schedule" settlement wording.
+// Exposed on the settlement copy as `monthsAhead`; no longer printed on the
+// receipt itself (see settlementCopy).
 export function monthsAhead(from: Date | string, to: Date | string): number {
   const a = new Date(from);
   const b = new Date(to);
@@ -93,8 +92,11 @@ export type SettlementCopy = {
 };
 
 // Richer client wording than settlementLabel: adds the "plan fully paid on
-// <date>, <N> months ahead of schedule / no further payments due" sentence once
-// the balance reaches zero. Purely presentational — never affects money.
+// <date>, no further payments due" sentence once the balance reaches zero.
+// The plan's schedule is deliberately NOT described on the receipt, so no
+// "months ahead of schedule" / "paid early" clause is emitted — a receipt
+// states what was paid, nothing about the schedule. Purely presentational —
+// never affects money.
 export function settlementCopy(opts: {
   balanceAfter: number;
   settledOn?: Date | string | null;
@@ -110,10 +112,9 @@ export function settlementCopy(opts: {
   const ahead =
     opts.settledOn && opts.scheduledEnd ? monthsAhead(opts.settledOn, opts.scheduledEnd) : null;
   let note = paidOn ? `Plan fully paid on ${paidOn}.` : "Plan fully paid.";
-  if (ahead && ahead > 0) note += ` ${ahead} month${ahead === 1 ? "" : "s"} ahead of schedule.`;
   note += " No further payments due.";
   // null (not 0) when the plan did not finish ahead of schedule, so callers
-  // show the "months ahead" clause only when there is one.
+  // can still surface the fact elsewhere if they choose to.
   return { settled: true, headline, note, monthsAhead: ahead && ahead > 0 ? ahead : null };
 }
 

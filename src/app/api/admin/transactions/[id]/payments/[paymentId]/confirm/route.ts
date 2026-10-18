@@ -114,8 +114,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
 
   // Full receipt content: every confirmed payment with receipt refs and
   // running balances, the account reference line, and the settlement label.
-  const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
-  const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
+  const { buildReceiptHistory, buildAccountRef, settlementCopy } = await import("@/lib/receipt-amounts");
   const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
     prisma.payment.findMany({
       where: { transactionId: txn.id, status: "CONFIRMED" },
@@ -126,18 +125,6 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
       ? prisma.inspectionBooking.findUnique({ where: { id: txn.bookingId }, select: { ref: true } })
       : null,
   ]);
-  // Allocation-derived label (waterfall rows), never the single installment
-  // link — a payment can span installments. Falls back to the targeted
-  // installment only when no allocation rows exist yet (pre-backfill).
-  const allocParts = await getAllocationLabelParts(prisma, confirmed.payment.id).catch(() => []);
-  const installmentLabel =
-    allocParts.length > 0
-      ? appliedToLabel(allocParts)
-      : confirmed.installment
-        ? confirmed.installment.type === "INITIAL"
-          ? "Initial payment"
-          : `Month ${confirmed.installment.installmentNumber} payment`
-        : undefined;
   const refByPayment = new Map(allReceipts.map((r) => [r.paymentId as string, r.ref]));
   // The just-confirmed receipt exists in the DB now (created in the unit).
   refByPayment.set(confirmed.payment.id, receiptRef);
@@ -201,7 +188,6 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
         totalPaidAfter: confirmed.newTotalPaid,
         outstandingBalance: confirmed.newOutstanding,
         transactionRef: txn.ref,
-        installmentLabel,
       }),
   });
 

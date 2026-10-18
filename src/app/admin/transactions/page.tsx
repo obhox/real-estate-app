@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
-import { formatNaira } from "@/lib/currency";
+import { formatNaira, formatSignedNaira } from "@/lib/currency";
 import { auth } from "@/auth";
 import { isInternalRole } from "@/lib/authz";
 import { redirect } from "next/navigation";
@@ -36,6 +36,7 @@ function daysPhrase(ov: TransactionOverview): string | null {
 // Computed from confirmed money via the finance service — never the stored
 // status label. The behind amount lives on the detail page.
 function stateChip(ov: TransactionOverview) {
+  if (ov.isOverpaid) return <span className="chip green">Overpaid</span>;
   if (ov.isFullyPaid) return <span className="chip green">Paid in full</span>;
   if (ov.isOverdue) return <span className="chip red">Behind</span>;
   return <span className="chip lg">On track</span>;
@@ -45,6 +46,9 @@ function stateChip(ov: TransactionOverview) {
 // shared helper (first unpaid installment after carry-forward), or
 // "Fully paid" once cleared.
 function nextDueLine(ov: TransactionOverview) {
+  if (ov.isOverpaid) {
+    return <div className="mono text-[10px] text-[#065F46]">Credit {formatNaira(ov.overpaidAmount)} · settled</div>;
+  }
   if (ov.isFullyPaid || !ov.nextInstallment) {
     return <div className="mono text-[10px] text-[#065F46]">Fully paid</div>;
   }
@@ -175,7 +179,7 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
                       <td>{t.estate}<small>{t.unitType ?? ""} {t.plotCode ?? ""}</small></td>
                       <td>{t.paymentPlan.name}</td>
                       <td className="r num">{formatNaira(t.totalPayable)}</td>
-                      <td className="r num"><span className={outstandingClass(ov)}>{formatNaira(outstanding)}</span><small>{ov.isFullyPaid ? "Fully paid" : ov.nextInstallment ? `${formatNaira(ov.nextInstallment.amountDue)} · ${daysPhrase(ov) ?? ""}` : ""}</small></td>
+                      <td className="r num"><span className={outstandingClass(ov)}>{formatSignedNaira(outstanding)}</span><small>{ov.isOverpaid ? `Credit ${formatNaira(ov.overpaidAmount)}` : ov.isFullyPaid ? "Fully paid" : ov.nextInstallment ? `${formatNaira(ov.nextInstallment.amountDue)} · ${daysPhrase(ov) ?? ""}` : ""}</small></td>
                       <td>{stateChip(ov)}</td>
                       <td className="r">›</td>
                     </ClickableRow>
@@ -209,7 +213,7 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
                     label: "Outstanding",
                     value: (
                       <span>
-                        <span className={`mono text-[12px] font-bold price ${outstandingClass(ov)}`}>{formatNaira(ov.outstanding)}</span>
+                        <span className={`mono text-[12px] font-bold price ${outstandingClass(ov)}`}>{formatSignedNaira(ov.outstanding)}</span>
                         {nextDueLine(ov)}
                       </span>
                     ),

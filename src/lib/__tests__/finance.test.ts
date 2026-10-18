@@ -3,10 +3,12 @@ import {
   getCollectedRevenue,
   getOverdueInstallments,
   getPendingVerification,
+  getTransactionFinancials,
   getTransactionOverviews,
   getTransactionSummary,
   toDisplayStatus,
   type FinanceDb,
+  type FinancialInstallmentInput,
 } from "../finance";
 
 // One dataset, three surfaces: dashboard revenue, ledger totals and the
@@ -153,5 +155,104 @@ describe("finance: installments", () => {
     expect(ov.overdueCount).toBe(summary?.overdueCount);
     expect(overviews.get("missing")).toBe(undefined);
     expect((await getTransactionOverviews([], fakeDb, NOW)).size).toBe(0);
+  });
+});
+
+// A balance-first rule: totalPayable - confirmedPaid decides the headline
+// status. A schedule whose rows don't sum to the contract can no longer make a
+// settled transaction read "Behind", and money past due is the only thing that
+// can make an unsettled one read "Behind".
+describe("finance: balance decides the status", () => {
+  const PAST2 = new Date("2026-09-01T00:00:00Z");
+  const FUTURE2 = new Date("2026-10-01T00:00:00Z");
+
+  const inst = (
+    installmentNumber: number,
+    dueDate: Date,
+    scheduledAmount: number,
+    confirmedPaid: number
+  ): FinancialInstallmentInput => ({ installmentNumber, type: "MONTHLY", dueDate, scheduledAmount, confirmedPaid });
+
+  it("schedule rows summing above the contract cannot make a settled txn Behind", () => {
+    // Sum(scheduled) 1.5m > contract 1.0m, all 1.0m paid: the trailing row is
+    // short and past due, but the client owes nothing.
+    const fin = getTransactionFinancials(
+      { totalPayable: 1_000_000, installments: [inst(0, PAST2, 600_000, 0), inst(1, PAST2, 900_000, 0)], unlinkedConfirmed: 1_000_000 },
+      NOW
+    );
+    expect(fin.outstanding).toBe(0);
+    expect(fin.isFullyPaid).toBe(true);
+    expect(fin.isOverdue).toBe(false);
+    expect(fin.overdueCount).toBe(0);
+    expect(fin.overdueAmount).toBe(0);
+    expect(fin.nextInstallment).toBe(null);
+    expect(fin.daysOverdue).toBe(null);
+  });
+
+  it("schedule deficit: every row covered but balance still owed — on track, flagged", () => {
+    const fin = getTransactionFinancials(
+      { totalPayable: 1_000_000, installments: [inst(0, PAST2, 400_000, 400_000), inst(1, PAST2, 300_000, 300_000)] },
+      NOW
+    );
+    expect(fin.outstanding).toBe(300_000);
+    expect(fin.isFullyPaid).toBe(false);
+    expect(fin.isOverdue).toBe(false);
+    expect(fin.nextInstallment).toBe(null);
+    expect(fin.scheduleDeficit).toBe(true);
+  });
+
+  it("overpayment is settled and flagged, never Behind", () => {
+    const fin = getTransactionFinancials(
+      { totalPayable: 1_000_000, installments: [inst(0, PAST2, 1_000_000, 1_000_000)], unlinkedConfirmed: 250_000 },
+      NOW
+    );
+    expect(fin.outstanding).toBe(-250_000);
+    expect(fin.isOverpaid).toBe(true);
+    expect(fin.overpaidAmount).toBe(250_000);
+    expect(fin.isFullyPaid).toBe(true);
+    expect(fin.isOverdue).toBe(false);
+  });
+
+  it("overdue is money past due, with days since the first uncovered due date", () => {
+    const fin = getTransactionFinancials(
+      { totalPayable: 10_000_000, installments: [inst(0, new Date("2026-09-01T00:00:00Z"), 2_000_000, 1_500_000), inst(1, FUTURE2, 2_000_000, 0)] },
+      NOW
+    );
+    expect(fin.overdueAmount).toBe(500_000);
+    expect(fin.overdueCount).toBe(1);
+    expect(fin.isOverdue).toBe(true);
+    expect(fin.daysOverdue).toBe(27);
+    expect(fin.nextInstallment?.amountDue).toBe(500_000);
+    expect(fin.daysUntilDue).toBe(null);
+  });
+
+  it("overdue amount equals remaining on the past-due rows (waterfall carry)", () => {
+    const fin = getTransactionFinancials(
+      {
+        totalPayable: 10_000_000,
+        installments: [inst(0, PAST2, 2_000_000, 2_000_000), inst(1, PAST2, 2_000_000, 500_000), inst(2, FUTURE2, 2_000_000, 0)],
+      },
+      NOW
+    );
+    expect(fin.overdueAmount).toBe(1_500_000);
+    expect(fin.overdueCount).toBe(1);
+    expect(fin.nextInstallment?.number).toBe(1);
+    expect(fin.nextInstallment?.amountDue).toBe(1_500_000);
+    // The next uncovered row is itself the past-due one, so it reads as overdue.
+    expect(fin.daysOverdue).toBe(27);
+    expect(fin.daysUntilDue).toBe(null);
+  });
+
+  it("next due advances as cumulative confirmed money grows", () => {
+    const schedule = [inst(0, PAST2, 3_233_333, 3_233_333), inst(1, FUTURE2, 3_233_333, 0), inst(2, FUTURE2, 3_233_334, 0)];
+    const mid = getTransactionFinancials({ totalPayable: 9_700_000, installments: schedule }, NOW);
+    expect(mid.nextInstallment?.number).toBe(1);
+    expect(mid.isOverdue).toBe(false);
+    const full = getTransactionFinancials(
+      { totalPayable: 9_700_000, installments: [schedule[0], { ...schedule[1], confirmedPaid: 3_233_333 }, { ...schedule[2] }] },
+      NOW
+    );
+    expect(full.nextInstallment?.number).toBe(2);
+    expect(full.isFullyPaid).toBe(false);
   });
 });

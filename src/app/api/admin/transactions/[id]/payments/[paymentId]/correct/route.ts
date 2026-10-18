@@ -231,8 +231,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   }
   const txn = replacement.transaction;
   const issuedDateStr = formatDateDMY(replacement.paymentDate);
-  const { buildReceiptHistory, buildAccountRef, settlementCopy, appliedToLabel } = await import("@/lib/receipt-amounts");
-  const { getAllocationLabelParts } = await import("@/lib/finance/ledger");
+  const { buildReceiptHistory, buildAccountRef, settlementCopy } = await import("@/lib/receipt-amounts");
   const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
     prisma.payment.findMany({ where: { transactionId: txn.id, status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } }),
     prisma.receipt.findMany({ where: { transactionId: txn.id }, select: { paymentId: true, ref: true } }),
@@ -252,18 +251,6 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
     logServerError(`receipt ${receiptRef}: QR generation failed`, e);
     return undefined;
   });
-  // Allocation-derived label for the replacement receipt (a corrected payment
-  // can span installments); falls back to the targeted installment only when
-  // no allocation rows exist yet.
-  const allocParts = await getAllocationLabelParts(prisma, replacement.id).catch(() => []);
-  const installmentLabel =
-    allocParts.length > 0
-      ? appliedToLabel(allocParts)
-      : replacement.installment
-        ? replacement.installment.type === "INITIAL"
-          ? "Initial payment"
-          : `Month ${replacement.installment.installmentNumber} payment`
-        : undefined;
   const settlement = settlementCopy({
     balanceAfter: txn.totalPayable - confirmedTotal,
     settledOn: replacement.paymentDate,
@@ -308,7 +295,6 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
         totalPaidAfter: confirmedTotal,
         outstandingBalance: txn.totalPayable - confirmedTotal,
         transactionRef: txn.ref,
-        installmentLabel,
       }),
   });
   if (!pdfOutcome.ok) {

@@ -4,17 +4,15 @@ import { receiptAmountsRows, settlementLabel, settlementCopy, settlementLetter, 
 describe("receiptAmountsRows", () => {
   const base = {
     thisPayment: 2_905_000,
-    installmentLabel: "Initial payment",
     totalPrice: 8_300_000,
     paidToDate: 2_905_000,
     balanceRemaining: 5_395_000,
     discount: 0,
   };
 
-  it("orders rows: This payment, Installment, Total price, Paid to date, Balance remaining", () => {
+  it("orders rows: This payment, Total price, Paid to date, Balance remaining", () => {
     expect(receiptAmountsRows(base).map((r) => r.label)).toEqual([
       "This payment",
-      "Installment",
       "Total price",
       "Paid to date",
       "Balance remaining",
@@ -28,14 +26,21 @@ describe("receiptAmountsRows", () => {
     expect(withDiscount.find((r) => r.key === "discount")?.value).toBe(200_000);
   });
 
-  it("omits the Installment row when there is no label", () => {
-    const rows = receiptAmountsRows({ ...base, installmentLabel: null });
-    expect(rows.map((r) => r.key)).toEqual(["this-payment", "total-price", "paid-to-date", "balance"]);
+  it("never includes an Installment row (a receipt carries no per-installment breakdown)", () => {
+    expect(receiptAmountsRows(base).map((r) => r.label)).not.toContain("Installment");
+    expect(receiptAmountsRows({ ...base, interestAmount: 375_000, discount: 50_000 }).map((r) => r.key)).toEqual([
+      "this-payment",
+      "total-price",
+      "interest",
+      "paid-to-date",
+      "balance",
+      "discount",
+    ]);
   });
 
   it("shows Interest directly under Total price when > 0 (TXN-2026-19362)", () => {
     const rows = receiptAmountsRows({ ...base, interestAmount: 375_000 });
-    expect(rows.map((r) => r.key)).toEqual(["this-payment", "installment", "total-price", "interest", "paid-to-date", "balance"]);
+    expect(rows.map((r) => r.key)).toEqual(["this-payment", "total-price", "interest", "paid-to-date", "balance"]);
     expect(rows.find((r) => r.key === "interest")?.value).toBe(375_000);
   });
 
@@ -67,8 +72,9 @@ describe("settlementCopy", () => {
     expect(copy.note).toBeNull();
   });
 
-  it("early settlement states the date and months ahead", () => {
-    // Paid 16 Oct 2026, plan ran to 14 Feb 2027 → 4 months ahead.
+  it("early settlement states the date and no longer mentions the schedule", () => {
+    // Paid 16 Oct 2026, plan ran to 14 Feb 2027 → 4 months ahead, but the
+    // receipt states only what was paid, never the schedule.
     const copy = settlementCopy({
       balanceAfter: 0,
       settledOn: new Date(2026, 9, 16),
@@ -78,10 +84,10 @@ describe("settlementCopy", () => {
     expect(copy.settled).toBe(true);
     expect(copy.headline).toBe("FINAL PAYMENT, ACCOUNT SETTLED");
     expect(copy.monthsAhead).toBe(4);
-    expect(copy.note).toBe("Plan fully paid on 16-10-2026. 4 months ahead of schedule. No further payments due.");
+    expect(copy.note).toBe("Plan fully paid on 16-10-2026. No further payments due.");
   });
 
-  it("settlement at/after the scheduled end omits the 'months ahead' clause", () => {
+  it("settlement at/after the scheduled end reports no months ahead", () => {
     const copy = settlementCopy({
       balanceAfter: 0,
       settledOn: new Date(2027, 2, 1),
