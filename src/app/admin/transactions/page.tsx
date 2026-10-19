@@ -64,7 +64,7 @@ function nextDueLine(ov: TransactionOverview) {
   return <div className="mono text-[10px] text-[var(--ops-muted)]">{head}{tail ? ` · ${tail}` : ""}</div>;
 }
 
-type SearchParams = { q?: string; status?: string; plan?: string; page?: string; showTest?: string };
+type SearchParams = { q?: string; status?: string; plan?: string; page?: string; showTest?: string; confirmedOnly?: string; corrections?: string };
 
 const PAGE_SIZE = 25;
 
@@ -77,6 +77,10 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
   const status = params.status ?? "";
   const plan = params.plan ?? "";
   const showTest = params.showTest === "1";
+  // Ledger PDF export options only — they never change this list. Defaults
+  // match the export endpoint: confirmed payments only, corrections off.
+  const confirmedOnly = params.confirmedOnly !== "0";
+  const includeCorrections = params.corrections === "1";
 
   const where: any = {};
   if (!showTest) where.isTest = false;
@@ -116,6 +120,8 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
     if (status) qs.set("status", status);
     if (plan) qs.set("plan", plan);
     if (showTest) qs.set("showTest", "1");
+    if (params.confirmedOnly) qs.set("confirmedOnly", params.confirmedOnly);
+    if (params.corrections) qs.set("corrections", params.corrections);
     return qs.toString();
   })();
   function buildQuery(overrides: Partial<SearchParams>) {
@@ -125,6 +131,8 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
     if (merged.status) qs.set("status", merged.status);
     if (merged.plan) qs.set("plan", merged.plan);
     if (merged.showTest) qs.set("showTest", merged.showTest);
+    if (merged.confirmedOnly) qs.set("confirmedOnly", merged.confirmedOnly);
+    if (merged.corrections) qs.set("corrections", merged.corrections);
     if (merged.page && merged.page !== "1") qs.set("page", merged.page);
     const str = qs.toString();
     return str ? `?${str}` : "";
@@ -158,9 +166,28 @@ export default async function TransactionsPage({ searchParams }: { searchParams:
             <form className="fs" action="/admin/transactions" method="get" style={{ flex: 1 }}>
               {status && <input type="hidden" name="status" value={status} />}
               {plan && <input type="hidden" name="plan" value={plan} />}
+              {params.confirmedOnly && <input type="hidden" name="confirmedOnly" value={params.confirmedOnly} />}
+              {params.corrections && <input type="hidden" name="corrections" value={params.corrections} />}
               <input name="q" defaultValue={q} placeholder="Search reference, client, property" style={{ border: "none", outline: "none", background: "transparent", flex: 1, fontSize: "12.5px" }} />
               {(q || status || plan) && <Link href="/admin/transactions" className="lnk">Clear</Link>}
             </form>
+            <div className="flex items-center gap-2" style={{ borderLeft: "1px solid var(--ops-border)", paddingLeft: 10 }}>
+              <span className="text-[11px] text-[var(--ops-muted)]">Ledger PDF:</span>
+              <Link
+                href={`/admin/transactions${buildQuery({ confirmedOnly: confirmedOnly ? "0" : undefined })}`}
+                className={`fp${confirmedOnly ? " on" : ""}`}
+                title="Hide payments that are not yet confirmed from the exported ledger"
+              >
+                Confirmed payments only
+              </Link>
+              <Link
+                href={`/admin/transactions${buildQuery({ corrections: includeCorrections ? undefined : "1" })}`}
+                className={`fp${includeCorrections ? " on" : ""}`}
+                title="Also show reversed and superseded entries in the exported ledger"
+              >
+                Include corrections
+              </Link>
+            </div>
           </div>
           <div className="hidden lg:block overflow-x-auto">
             <table className="t">

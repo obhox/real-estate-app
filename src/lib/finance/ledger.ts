@@ -648,15 +648,36 @@ export type EffectiveEntry = {
   note: string | null;
 };
 
-export async function getEffectiveEntries(tx: TxClient, transactionId: string): Promise<EffectiveEntry[]> {
-  const [entries, receipts] = await Promise.all([
-    tx.ledgerEntry.findMany({
-      where: { transactionId },
-      include: { payment: { select: { paymentReference: true } } },
-    }),
-    tx.receipt.findMany({ where: { transactionId }, select: { paymentId: true, ref: true } }),
-  ]);
-  const refByPayment = new Map(receipts.map((r) => [r.paymentId as string, r.ref]));
+// The shapes selectEffectiveEntries reads. Kept explicit so a caller can
+// bulk-fetch every transaction's entries + receipts in ONE query each and
+// still run the single shared rule — never a second implementation of it.
+export type LedgerEntryRowForEffective = {
+  id: string;
+  type: string;
+  amount: number;
+  direction: string;
+  effectiveDate: Date;
+  createdAt: Date;
+  method: string | null;
+  bankReference: string | null;
+  paymentId: string | null;
+  note: string | null;
+  reversesEntryId: string | null;
+  payment: { paymentReference: string | null } | null;
+};
+
+export type ReceiptRowForEffective = { paymentId: string | null; ref: string };
+
+// Pure core of getEffectiveEntries: exclude REVERSAL lines and the entries
+// they reverse, attach each payment's receipt ref, and order by the shared
+// ledger rule. Shared by the single-transaction and multi-transaction readers.
+export function selectEffectiveEntries(
+  entries: LedgerEntryRowForEffective[],
+  receipts: ReceiptRowForEffective[]
+): EffectiveEntry[] {
+  const refByPayment = new Map(
+    receipts.filter((r) => r.paymentId).map((r) => [r.paymentId as string, r.ref])
+  );
   const reversedEntryIds = new Set(
     entries.filter((e) => e.type === "REVERSAL" && e.reversesEntryId).map((e) => e.reversesEntryId as string)
   );
@@ -678,6 +699,17 @@ export async function getEffectiveEntries(tx: TxClient, transactionId: string): 
         note: e.note,
       }))
   );
+}
+
+export async function getEffectiveEntries(tx: TxClient, transactionId: string): Promise<EffectiveEntry[]> {
+  const [entries, receipts] = await Promise.all([
+    tx.ledgerEntry.findMany({
+      where: { transactionId },
+      include: { payment: { select: { paymentReference: true } } },
+    }),
+    tx.receipt.findMany({ where: { transactionId }, select: { paymentId: true, ref: true } }),
+  ]);
+  return selectEffectiveEntries(entries, receipts);
 }
 
 // ---------------------------------------------------------------------------

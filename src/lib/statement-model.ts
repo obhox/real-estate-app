@@ -7,6 +7,7 @@ import {
   type TxClient,
 } from "@/lib/finance/ledger";
 import { chargeSubtitle, refLine } from "@/lib/statement";
+import { resolveContractDate } from "@/lib/contract-date";
 
 export const STATEMENT_LAYOUT_VERSION = "stmt-v1";
 
@@ -123,24 +124,18 @@ export async function buildStatementModel(
   // payment date — confirmed or still pending (a pending payment never prints
   // on the statement; it only dates the opening charge so a backdated record
   // doesn't sort the charge last and drive balances negative); otherwise
-  // creation (no payments at all).
+  // creation (no payments at all). Shared rule lives in @/lib/contract-date.
   // The fallback is internal-only: the client statement never prints "assumed".
-  let contractDateUsed: Date;
-  let contractAssumed = false;
+  const resolved = resolveContractDate(
+    { contractDate: txn.contractDate, createdAt: txn.createdAt },
+    payments.map((p) => ({ status: p.status, paymentDate: p.paymentDate })),
+    { includePending: true, detectCreationArtifact: false }
+  );
+  const contractDateUsed = resolved.date;
+  const contractAssumed = resolved.assumed;
   const datedPayments = payments.filter(
     (p) => p.status === "CONFIRMED" || p.status === "PENDING_VERIFICATION"
   );
-  if (txn.contractDate) {
-    contractDateUsed = new Date(txn.contractDate);
-  } else if (datedPayments.length > 0) {
-    contractDateUsed = new Date(
-      Math.min(...datedPayments.map((p) => new Date(p.paymentDate).getTime()))
-    );
-    contractAssumed = true;
-  } else {
-    contractDateUsed = new Date(txn.createdAt);
-    contractAssumed = true;
-  }
 
   const subtitle = chargeSubtitle(txn.estate, txn.plotCode);
   type Ranked = { id: string; type: string; effectiveDate: Date; createdAt: Date };

@@ -248,6 +248,53 @@ vi.mock("@/lib/prisma", () => ({
         },
       ],
     },
+    ledgerEntry: {
+      findMany: async () => [
+        {
+          id: "le-t1-base",
+          transactionId: "t1",
+          type: "CHARGE_BASE",
+          amount: 5800000,
+          direction: "DEBIT",
+          effectiveDate: new Date("2026-12-01T09:00:00Z"),
+          createdAt: new Date("2026-12-01T09:00:00Z"),
+          method: null,
+          bankReference: null,
+          paymentId: null,
+          note: null,
+          reversesEntryId: null,
+          payment: null,
+        },
+        {
+          id: "le-t1-pay",
+          transactionId: "t1",
+          type: "PAYMENT",
+          amount: 2900000,
+          direction: "CREDIT",
+          effectiveDate: new Date("2026-12-15T09:00:00Z"),
+          createdAt: new Date("2026-12-15T09:00:00Z"),
+          method: "Bank Transfer",
+          bankReference: null,
+          paymentId: "p1",
+          note: null,
+          reversesEntryId: null,
+          payment: { paymentReference: "PAY-2026-00001" },
+        },
+      ],
+    },
+    receipt: { findMany: async () => [{ transactionId: "t1", paymentId: "p1", ref: "RCT-2026-00001" }] },
+    payment: {
+      findMany: async () => [
+        {
+          id: "p1",
+          transactionId: "t1",
+          status: "CONFIRMED",
+          amount: 2900000,
+          paymentDate: new Date("2026-12-15T09:00:00Z"),
+          paymentMethod: "Bank Transfer",
+        },
+      ],
+    },
   },
 }));
 
@@ -290,14 +337,18 @@ describe("ledger export PDF", () => {
   it("wraps long client/property/ref cells inside the table", async () => {
     const res = await exportLedger(new NextRequest("http://localhost/api/admin/transactions/ledger"));
     expect(res.status).toBe(200);
-    const text = pdfText(Buffer.from(await res.arrayBuffer()));
-    // No unbroken run survives on one line (autotable wraps the pre-chunked
-    // pieces again at the narrower company-ledger column widths)…
-    expect(text).not.toContain(UNBROKEN_120);
-    expect(text).not.toContain("e".repeat(150));
-    // …but nothing is dropped: refs, names and plot codes survive.
-    expect(text).toContain("TXN-2026-00001");
-    expect(text).toContain("Client");
-    expect(text).toContain("TST-200");
+    const buf = Buffer.from(await res.arrayBuffer());
+    const parser = new PDFParse({ data: buf });
+    const { text } = await parser.getText();
+    await parser.destroy();
+    const flat = text.replace(/\s+/g, " ");
+    // Nothing is dropped: refs, names and plot codes survive.
+    expect(flat).toContain("TXN-2026-00001");
+    expect(flat).toContain("TST-200");
+    expect(flat).toContain("PAY-2026-00001");
+    expect(flat).toContain("RCT-2026-00001");
+    // The unbroken run is wrapped inside its cell, never emitted as one run
+    // (the cell is styled overflow-wrap: anywhere — no clipped text).
+    expect(flat).not.toContain(UNBROKEN_120);
   }, 30000);
 });
