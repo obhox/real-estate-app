@@ -11,12 +11,23 @@ import {
   reverseConfirmedPaymentDbUnit,
   toUserFacingError,
   logServerError,
+  isTransientDbError,
 } from "@/lib/paymentConfirmation";
 import { generateAndStoreReceiptPdf } from "@/lib/receiptDelivery";
 import { formatDateDMY, toDateOnlyNoonUtc } from "@/lib/time";
 
 export const maxDuration = 60;
 
+// The correction is only a handful of statements, but against a pooled remote
+// database it takes seconds: the original 5s maxWait / 15s timeout pair was
+// tight enough that a cold connection failed the whole thing with a P2028 and
+// reported only "Couldn't save. Please try again." The unit is atomic, so a
+// transient failure left nothing behind and may simply be retried — but only
+// while there is room for another full attempt inside maxDuration.
+const TX_OPTIONS = { maxWait: 15000, timeout: 25000 };
+const MAX_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 300;
+const RETRY_BUDGET_MS = 25_000;
 
 
 // Correct a CONFIRMED payment: visible reversal of the original plus a
@@ -29,6 +40,7 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   const session = await auth();
   if (!isInternalRole(session?.user?.role)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id, paymentId } = await ctx.params;
+  const startedAt = Date.now();
   const body = await request.json().catch(() => null);
   if (!body) return NextResponse.json({ error: "Invalid body" }, { status: 400 });
 
@@ -54,25 +66,41 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   }
   const bankOverride = typeof body.bankReference === "string" && body.bankReference.trim() ? body.bankReference.trim() : null;
 
-  const original = await prisma.payment.findUnique({
-    where: { id: paymentId },
-    include: { transaction: { select: { id: true, ref: true, outstandingBalance: true, bookingId: true } } },
-  });
-  if (!original || original.transactionId !== id) {
-    return NextResponse.json({ error: "Payment not found for this transaction." }, { status: 404 });
-  }
-  if (original.status !== "CONFIRMED") {
-    return NextResponse.json({ error: "Only confirmed payments can be corrected." }, { status: 409 });
-  }
-  // Idempotent replay: a replacement already exists for this payment.
-  const prior = await prisma.payment.findFirst({ where: { correctsPaymentId: paymentId } });
-  if (prior) {
-    const priorReceipt = await prisma.receipt.findUnique({ where: { paymentId: prior.id } });
-    return NextResponse.json({ payment: prior, receipt: priorReceipt, deduped: true });
-  }
-  // Post-reversal headroom: the correction must fit without creating credit.
-  if (newAmount > original.transaction.outstandingBalance + original.amount) {
-    return NextResponse.json({ error: "Corrected amount exceeds the available balance. Record any excess separately as credit." }, { status: 400 });
+  // Pre-flight reads, guarded as a unit. A database hiccup in any of them used
+  // to escape as a bare 500 with no logged cause and nothing the admin could act on.
+  const loadOriginal = () =>
+    prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: { transaction: { select: { id: true, ref: true, outstandingBalance: true, bookingId: true } } },
+    });
+  let original!: NonNullable<Awaited<ReturnType<typeof loadOriginal>>>;
+  // Read before the write: the mid-tx void can briefly drop a sold booking.
+  let bookingBefore: { outcome: string | null } | null = null;
+  try {
+    const found = await loadOriginal();
+    if (!found || found.transactionId !== id) {
+      return NextResponse.json({ error: "Payment not found for this transaction." }, { status: 404 });
+    }
+    original = found;
+    if (original.status !== "CONFIRMED") {
+      return NextResponse.json({ error: "Only confirmed payments can be corrected." }, { status: 409 });
+    }
+    // Idempotent replay: a replacement already exists for this payment.
+    const prior = await prisma.payment.findFirst({ where: { correctsPaymentId: paymentId } });
+    if (prior) {
+      const priorReceipt = await prisma.receipt.findUnique({ where: { paymentId: prior.id } });
+      return NextResponse.json({ payment: prior, receipt: priorReceipt, deduped: true });
+    }
+    // Post-reversal headroom: the correction must fit without creating credit.
+    if (newAmount > original.transaction.outstandingBalance + original.amount) {
+      return NextResponse.json({ error: "Corrected amount exceeds the available balance. Record any excess separately as credit." }, { status: 400 });
+    }
+    bookingBefore = original.transaction.bookingId
+      ? await prisma.inspectionBooking.findUnique({ where: { id: original.transaction.bookingId }, select: { outcome: true } })
+      : null;
+  } catch (e) {
+    logServerError(`correct payment ${paymentId}: pre-flight read failed`, e);
+    return NextResponse.json({ error: "Couldn't load the payment. Nothing was changed — try again." }, { status: 503 });
   }
 
   let receiptRef: string;
@@ -96,19 +124,14 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   const accessToken = generateReceiptAccessToken();
   const receiptUrl = getReceiptAccessUrl(accessToken);
   const actorName = session!.user.name ?? session!.user.email ?? "Unknown";
-  const bookingBefore = original.transaction.bookingId
-    ? await prisma.inspectionBooking.findUnique({ where: { id: original.transaction.bookingId }, select: { outcome: true } })
-    : null;
 
-  let replacementId: string;
-  let receiptId: string;
   let originalReceiptRef: string | null = null;
   // The original's free-text note (if any) moves verbatim into the correction
   // audit below, then is cleared — after a correction it would be wrong and
   // confusing on the payment row. Display truncates long notes regardless.
   const originalNotes = original.notes ?? null;
-  try {
-    const out = await prisma.$transaction(
+  const runCorrection = () =>
+    prisma.$transaction(
       async (tx) => {
         // 1. Visible reversal of the original (stored totals move back).
         await reverseConfirmedPaymentDbUnit(tx, {
@@ -207,107 +230,151 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
             });
           }
         }
-        return { replacementId: replacement.id, receiptId: confirmed.receiptId, payment: confirmed.payment };
+        return { replacementId: replacement.id, receiptId: confirmed.receiptId };
       },
-      { maxWait: 5000, timeout: 15000 }
+      TX_OPTIONS
     );
-    replacementId = out.replacementId;
-    receiptId = out.receiptId;
-  } catch (e) {
-    logServerError(`correct payment ${paymentId}`, e);
-    return NextResponse.json({ error: toUserFacingError(e, "save") }, { status: 500 });
+
+  // Atomic: a failure means nothing was written, so a transient failure is safe
+  // to retry. The attempt that failed may nonetheless have committed — the
+  // response is what was lost — so look for a replacement before retrying, and
+  // only retry while another full attempt still fits inside maxDuration.
+  let outcome: Awaited<ReturnType<typeof runCorrection>> | null = null;
+  let failure: unknown = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      outcome = await runCorrection();
+      break;
+    } catch (e) {
+      failure = e;
+      if (!isTransientDbError(e)) break;
+      const committed = await prisma.payment.findFirst({ where: { correctsPaymentId: paymentId } }).catch((lookupError) => {
+        logServerError(`correct payment ${paymentId}: post-failure replay check failed`, lookupError);
+        return null;
+      });
+      if (committed) {
+        const committedReceipt = await prisma.receipt.findUnique({ where: { paymentId: committed.id } }).catch((lookupError) => {
+          logServerError(`correct payment ${paymentId}: post-failure receipt lookup failed`, lookupError);
+          return null;
+        });
+        logServerError(`correct payment ${paymentId}: attempt ${attempt} reported a failure but committed`, e);
+        return NextResponse.json({ payment: committed, receipt: committedReceipt, deduped: true });
+      }
+      if (attempt >= MAX_ATTEMPTS || Date.now() - startedAt >= RETRY_BUDGET_MS) break;
+      logServerError(`correct payment ${paymentId}: attempt ${attempt} failed, retrying once`, e);
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+    }
   }
+  if (!outcome) {
+    logServerError(`correct payment ${paymentId}`, failure);
+    // Transient failures answer 503 (retryable); a rejection of the request
+    // itself answers 500. Either way the message says whether anything changed.
+    return NextResponse.json({ error: toUserFacingError(failure, "save") }, { status: isTransientDbError(failure) ? 503 : 500 });
+  }
+  const { replacementId, receiptId } = outcome;
 
   // ---- Post-commit: render + store the replacement PDF (never emailed here) ----
-  const replacement = await prisma.payment.findUnique({
-    where: { id: replacementId },
-    include: {
-      transaction: { include: { installments: true, paymentPlan: true } },
-      installment: true,
-    },
-  });
-  if (!replacement || !replacement.transaction) {
-    return NextResponse.json({ error: "Correction committed but the replacement could not be reloaded." }, { status: 500 });
-  }
-  const txn = replacement.transaction;
-  const issuedDateStr = formatDateDMY(replacement.paymentDate);
-  const { buildReceiptHistory, buildAccountRef, settlementCopy } = await import("@/lib/receipt-amounts");
-  const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
-    prisma.payment.findMany({ where: { transactionId: txn.id, status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } }),
-    prisma.receipt.findMany({ where: { transactionId: txn.id }, select: { paymentId: true, ref: true } }),
-    txn.bookingId ? prisma.inspectionBooking.findUnique({ where: { id: txn.bookingId }, select: { ref: true } }) : null,
-  ]);
-  const refByPayment = new Map(allReceipts.map((r) => [r.paymentId as string, r.ref]));
-  refByPayment.set(replacement.id, receiptRef);
-  const confirmedTotal = allConfirmed.reduce((s, p) => s + p.amount, 0);
-  const history = buildReceiptHistory(
-    allConfirmed.map((p) => ({ id: p.id, date: p.paymentDate, method: p.paymentMethod ?? "Bank Transfer", amount: p.amount })),
-    refByPayment,
-    replacement.id,
-    txn.totalPayable,
-    formatDateDMY
-  );
-  const qrDataUrl = await generateQrDataUrl(receiptUrl).catch((e) => {
-    logServerError(`receipt ${receiptRef}: QR generation failed`, e);
-    return undefined;
-  });
-  const settlement = settlementCopy({
-    balanceAfter: txn.totalPayable - confirmedTotal,
-    settledOn: replacement.paymentDate,
-    scheduledEnd: txn.installments[txn.installments.length - 1]?.dueDate ?? null,
-    formatDate: formatDateDMY,
-  });
-  const pdfOutcome = await generateAndStoreReceiptPdf({
-    db: prisma,
-    receiptId,
-    ref: receiptRef,
-    render: () =>
-      generateReceiptPdf({
-        ref: receiptRef,
-        issuedDate: formatDateDMY(new Date()),
-        clientName: txn.customerName,
-        clientAddress: `${txn.estate} · ${txn.unitType ?? "Plot"} · ${txn.plotCode ?? txn.ref}`,
-        clientPhone: txn.customerPhone ?? "",
-        clientEmail: txn.customerEmail,
-        estateName: txn.estate,
-        unitType: txn.unitType ?? "Plot",
-        plotCode: txn.plotCode ?? txn.ref,
-        amountPaid: replacement.amount,
-        soldPrice: txn.baseAmount,
-        discount: 0,
-        payments: [{ date: issuedDateStr, method: replacement.paymentMethod ?? "Bank Transfer", amount: replacement.amount }],
-        history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
-        accountRef: buildAccountRef(txn.ref, bookingRow?.ref ?? null),
-        replacesRef: originalReceiptRef,
-        label: settlement.headline,
-        settlementNote: settlement.note,
-        paymentDate: issuedDateStr,
-        paymentMethodLabel: replacement.paymentMethod ?? "Bank Transfer",
-        bankReference: replacement.bankReference ?? null,
-        receiptUrl,
-        qrDataUrl,
-        unitPrice: txn.unitPrice,
-        plotQuantity: txn.plotQuantity,
-        paymentPlanName: txn.paymentPlan?.name,
-        interestAmount: txn.interestAmount,
-        totalPayable: txn.totalPayable,
-        previouslyPaid: confirmedTotal - replacement.amount,
-        totalPaidAfter: confirmedTotal,
-        outstandingBalance: txn.totalPayable - confirmedTotal,
-        transactionRef: txn.ref,
-      }),
-  });
-  if (!pdfOutcome.ok) {
+  // Everything below the commit is best-effort. A failure here must report what
+  // landed and what still needs doing — a bare 500 would read as "nothing was
+  // saved" and invite the admin to correct the payment a second time.
+  const committedButUnprepared = (what: string) =>
+    NextResponse.json({
+      replacement: { id: replacementId },
+      receipt: { id: receiptId, ref: receiptRef },
+      originalReceiptRef,
+      warning: `Correction committed, but ${what}. Retry from the receipt page.`,
+    });
+  try {
+    const replacement = await prisma.payment.findUnique({
+      where: { id: replacementId },
+      include: {
+        transaction: { include: { installments: true, paymentPlan: true } },
+        installment: true,
+      },
+    });
+    if (!replacement || !replacement.transaction) {
+      logServerError(`correct payment ${paymentId}: replacement ${replacementId} not reloadable after commit`, null);
+      return committedButUnprepared("the replacement could not be reloaded");
+    }
+    const txn = replacement.transaction;
+    const issuedDateStr = formatDateDMY(replacement.paymentDate);
+    const { buildReceiptHistory, buildAccountRef, settlementCopy } = await import("@/lib/receipt-amounts");
+    const [allConfirmed, allReceipts, bookingRow] = await Promise.all([
+      prisma.payment.findMany({ where: { transactionId: txn.id, status: "CONFIRMED" }, select: { id: true, amount: true, paymentDate: true, paymentMethod: true } }),
+      prisma.receipt.findMany({ where: { transactionId: txn.id }, select: { paymentId: true, ref: true } }),
+      txn.bookingId ? prisma.inspectionBooking.findUnique({ where: { id: txn.bookingId }, select: { ref: true } }) : null,
+    ]);
+    const refByPayment = new Map(allReceipts.map((r) => [r.paymentId as string, r.ref]));
+    refByPayment.set(replacement.id, receiptRef);
+    const confirmedTotal = allConfirmed.reduce((s, p) => s + p.amount, 0);
+    const history = buildReceiptHistory(
+      allConfirmed.map((p) => ({ id: p.id, date: p.paymentDate, method: p.paymentMethod ?? "Bank Transfer", amount: p.amount })),
+      refByPayment,
+      replacement.id,
+      txn.totalPayable,
+      formatDateDMY
+    );
+    const qrDataUrl = await generateQrDataUrl(receiptUrl).catch((e) => {
+      logServerError(`receipt ${receiptRef}: QR generation failed`, e);
+      return undefined;
+    });
+    const settlement = settlementCopy({
+      balanceAfter: txn.totalPayable - confirmedTotal,
+      settledOn: replacement.paymentDate,
+      scheduledEnd: txn.installments[txn.installments.length - 1]?.dueDate ?? null,
+      formatDate: formatDateDMY,
+    });
+    const pdfOutcome = await generateAndStoreReceiptPdf({
+      db: prisma,
+      receiptId,
+      ref: receiptRef,
+      render: () =>
+        generateReceiptPdf({
+          ref: receiptRef,
+          issuedDate: formatDateDMY(new Date()),
+          clientName: txn.customerName,
+          clientAddress: `${txn.estate} · ${txn.unitType ?? "Plot"} · ${txn.plotCode ?? txn.ref}`,
+          clientPhone: txn.customerPhone ?? "",
+          clientEmail: txn.customerEmail,
+          estateName: txn.estate,
+          unitType: txn.unitType ?? "Plot",
+          plotCode: txn.plotCode ?? txn.ref,
+          amountPaid: replacement.amount,
+          soldPrice: txn.baseAmount,
+          discount: 0,
+          payments: [{ date: issuedDateStr, method: replacement.paymentMethod ?? "Bank Transfer", amount: replacement.amount }],
+          history: history.map((h) => ({ date: h.date, method: h.method, amount: h.amount, receiptRef: h.receiptRef, runningBalance: h.runningBalance, isCurrent: h.isCurrent })),
+          accountRef: buildAccountRef(txn.ref, bookingRow?.ref ?? null),
+          replacesRef: originalReceiptRef,
+          label: settlement.headline,
+          settlementNote: settlement.note,
+          paymentDate: issuedDateStr,
+          paymentMethodLabel: replacement.paymentMethod ?? "Bank Transfer",
+          bankReference: replacement.bankReference ?? null,
+          receiptUrl,
+          qrDataUrl,
+          unitPrice: txn.unitPrice,
+          plotQuantity: txn.plotQuantity,
+          paymentPlanName: txn.paymentPlan?.name,
+          interestAmount: txn.interestAmount,
+          totalPayable: txn.totalPayable,
+          previouslyPaid: confirmedTotal - replacement.amount,
+          totalPaidAfter: confirmedTotal,
+          outstandingBalance: txn.totalPayable - confirmedTotal,
+          transactionRef: txn.ref,
+        }),
+    });
+    if (!pdfOutcome.ok) {
+      return committedButUnprepared("the replacement PDF failed");
+    }
     return NextResponse.json({
       replacement: { id: replacementId },
       receipt: { id: receiptId, ref: receiptRef },
-      warning: "Correction committed, but the replacement PDF failed. Retry from the receipt page.",
+      originalReceiptRef,
+      needsEmail: true,
     });
+  } catch (e) {
+    logServerError(`correct payment ${paymentId}: post-commit receipt render failed`, e);
+    return committedButUnprepared("the replacement receipt could not be prepared");
   }
-  return NextResponse.json({
-    replacement: { id: replacementId },
-    receipt: { id: receiptId, ref: receiptRef },
-    originalReceiptRef,
-    needsEmail: true,
-  });
 }

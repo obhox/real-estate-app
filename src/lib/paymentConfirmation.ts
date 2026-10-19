@@ -104,6 +104,25 @@ export function wouldExceedSchedule(
   return confirmedPaid + pendingSum + newAmount > scheduledAmount;
 }
 
+// Prisma puts the driver/server error code on `code`. Anything that is not a
+// Prisma error has no code, and must fall through to the generic message.
+export function prismaErrorCode(error: unknown): string | null {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code: unknown }).code)
+    : null;
+}
+
+// Connection and transaction failures that Prisma rolls back. The write did not
+// land, so the caller may retry the same unit of work safely: P2028 (transaction
+// expired or timed out), P2034 (write conflict or deadlock), P1001/P1002/P1017
+// (cannot reach the database, or lost it).
+const TRANSIENT_DB_CODES = new Set(["P2028", "P2034", "P1001", "P1002", "P1017"]);
+
+export function isTransientDbError(error: unknown): boolean {
+  const code = prismaErrorCode(error);
+  return code !== null && TRANSIENT_DB_CODES.has(code);
+}
+
 // Never render these raw: Prisma messages carry constraint names, table
 // names, and driver detail that mean nothing to an admin and may leak paths.
 export function toUserFacingError(error: unknown, action: "confirm" | "record" | "void" | "save" | "booking"): string {
@@ -140,14 +159,17 @@ export function toUserFacingError(error: unknown, action: "confirm" | "record" |
   if (error instanceof PaymentCorruptStateError) {
     return "The payment data looks inconsistent, so nothing was changed. Ask engineering to review the audit log.";
   }
-  const code =
-    typeof error === "object" && error !== null && "code" in error
-      ? String((error as { code: unknown }).code)
-      : null;
+  const code = prismaErrorCode(error);
   if (code === "P2002") return "This was already recorded. Refresh to see the latest state.";
   if (code === "P2025") return "The record no longer exists. Refresh to see the latest state.";
   if (code === "P2034") return "Someone else just changed this. Refresh and try again.";
   if (code === "P2022") return "Database update pending: deploy the latest migrations, then retry.";
+  // Transient failures: the transaction rolled back, so say so plainly. "Try
+  // again" alone leaves an admin unable to tell a safe retry from a double post.
+  if (code === "P2028") return "The database took too long, so nothing was changed. Please try again.";
+  if (code === "P1001" || code === "P1002" || code === "P1017") {
+    return "The database was unreachable, so nothing was changed. Please try again.";
+  }
   return `Couldn't ${verb}. Please try again.`;
 }
 

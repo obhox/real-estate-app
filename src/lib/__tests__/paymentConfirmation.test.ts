@@ -5,6 +5,7 @@ import {
   applyConfirmationDbUnit,
   reverseConfirmedPaymentDbUnit,
   toUserFacingError,
+  isTransientDbError,
   PaymentAlreadyHandledError,
   OverScheduleError,
   TotalBalanceExceededError,
@@ -1115,5 +1116,35 @@ describe("toUserFacingError", () => {
     expect(overMsg).toContain("outstanding balance");
     expect(overMsg).not.toContain("TotalBalanceExceededError");
     expect(toUserFacingError({ code: "P2002" }, "record")).toContain("already recorded");
+  });
+
+  it("says nothing was changed when a transient failure rolled the transaction back", () => {
+    const expired = toUserFacingError({ code: "P2028" }, "save");
+    expect(expired).toBe("The database took too long, so nothing was changed. Please try again.");
+
+    const unreachable = toUserFacingError({ code: "P1001" }, "save");
+    expect(unreachable).toBe("The database was unreachable, so nothing was changed. Please try again.");
+    expect(toUserFacingError({ code: "P1017" }, "save")).toBe(unreachable);
+    expect(toUserFacingError({ code: "P1002" }, "save")).toBe(unreachable);
+  });
+
+  it("classifies only the retryable Prisma codes as transient", () => {
+    // These rolled back, so the same unit of work may be attempted again.
+    for (const code of ["P2028", "P2034", "P1001", "P1002", "P1017"]) {
+      expect(isTransientDbError({ code })).toBe(true);
+    }
+    // A rejection of the request itself, or a code with no evidence of a
+    // rollback, must not be retried.
+    expect(isTransientDbError({ code: "P2002" })).toBe(false);
+    expect(isTransientDbError({ code: "P2025" })).toBe(false);
+    expect(isTransientDbError(new PaymentAlreadyHandledError("x"))).toBe(false);
+    expect(isTransientDbError(new Error("socket closed"))).toBe(false);
+    expect(isTransientDbError(null)).toBe(false);
+    expect(isTransientDbError("P2028")).toBe(false);
+  });
+
+  it("keeps the retryable message distinct from the generic one", () => {
+    // "Try again" alone cannot tell an admin a safe retry from a double post.
+    expect(toUserFacingError({ code: "P2028" }, "save")).not.toBe(toUserFacingError(new Error("boom"), "save"));
   });
 });

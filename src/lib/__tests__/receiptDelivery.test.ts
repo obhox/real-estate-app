@@ -29,7 +29,7 @@ describe("generateAndStoreReceiptPdf", () => {
     expect(render).toHaveBeenCalledOnce();
     expect(update).toHaveBeenCalledWith({
       where: { id: "rcpt-1" },
-      data: { pdfStatus: "GENERATED", lastError: null, pdfData: expect.any(Buffer) },
+      data: { pdfStatus: "GENERATED", pdfData: expect.any(Buffer) },
     });
   });
 
@@ -49,7 +49,7 @@ describe("generateAndStoreReceiptPdf", () => {
     expect(result.error).toContain("font subset missing");
     expect(update).toHaveBeenCalledWith({
       where: { id: "rcpt-1" },
-      data: { pdfStatus: "FAILED", lastError: "font subset missing" },
+      data: { pdfStatus: "FAILED" },
     });
   });
 
@@ -70,7 +70,7 @@ describe("generateAndStoreReceiptPdf", () => {
     expect(result.ok).toBe(false);
     expect(update).toHaveBeenCalledWith({
       where: { id: "rcpt-1" },
-      data: { pdfStatus: "FAILED", lastError: expect.stringContaining("ENOSPC") },
+      data: { pdfStatus: "FAILED" },
     });
   });
 

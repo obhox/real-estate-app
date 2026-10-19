@@ -4,9 +4,9 @@ import { logServerError } from "./paymentConfirmation";
 // transaction commits — PDF rendering and email can each take seconds, and
 // none of them may ever roll back a CONFIRMED payment. No filesystem
 // anywhere: the PDF bytes are stored on the receipt row (pdfData) once and
-// reused for every send/download. Every failure is recorded on the receipt
-// row (pdfStatus/emailStatus + lastError) and logged; helpers never throw
-// for delivery failures.
+// reused for every send/download. A PDF failure is recorded on the receipt
+// row (pdfStatus) and logged; helpers never throw for delivery failures.
+// Email has no failure column: not-emailed is simply sentAt == null.
 
 export interface ReceiptStatusStore {
   update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>;
@@ -37,7 +37,7 @@ export async function generateAndStoreReceiptPdf(opts: {
     buffer = await opts.render();
   } catch (error) {
     logServerError(`receipt ${opts.ref}: PDF render failed`, error);
-    await markPdf(opts.db, opts.receiptId, "FAILED", shortMessage(error));
+    await markPdf(opts.db, opts.receiptId, "FAILED");
     return { ok: false, error: shortMessage(error) };
   }
   try {
@@ -46,10 +46,10 @@ export async function generateAndStoreReceiptPdf(opts: {
     }
   } catch (error) {
     logServerError(`receipt ${opts.ref}: PDF store failed`, error);
-    await markPdf(opts.db, opts.receiptId, "FAILED", shortMessage(error));
+    await markPdf(opts.db, opts.receiptId, "FAILED");
     return { ok: false, error: shortMessage(error) };
   }
-  await markPdf(opts.db, opts.receiptId, "GENERATED", null, buffer);
+  await markPdf(opts.db, opts.receiptId, "GENERATED", buffer);
   return { ok: true, error: null, bytes: buffer };
 }
 
@@ -57,13 +57,12 @@ async function markPdf(
   db: DeliveryDb,
   receiptId: string,
   pdfStatus: "GENERATED" | "FAILED",
-  lastError: string | null,
   pdfData?: Buffer
 ): Promise<void> {
   try {
     await db.receipt.update({
       where: { id: receiptId },
-      data: { pdfStatus, lastError, ...(pdfData ? { pdfData } : {}) },
+      data: { pdfStatus, ...(pdfData ? { pdfData } : {}) },
     });
   } catch (error) {
     // The payment is already confirmed; a bookkeeping write failing must not

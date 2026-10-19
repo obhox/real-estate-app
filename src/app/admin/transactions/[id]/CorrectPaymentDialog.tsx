@@ -35,11 +35,13 @@ export default function CorrectPaymentDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   async function openDialog() {
     setOpen(true);
     setError(null);
     setResult(null);
+    setWarning(null);
     if (loaded) return;
     setLoading(true);
     try {
@@ -100,6 +102,9 @@ export default function CorrectPaymentDialog({
           ? "A replacement already exists for this payment — no duplicate created."
           : `Corrected: replacement payment issued, receipt ${data.receipt?.ref ?? ""}. Original receipt ${data.originalReceiptRef ?? ""} voided. Nothing emailed — use the correction email to notify the client.`
       );
+      // Committed, but the receipt PDF needs a retry: the correction did land,
+      // so this must not read as a failure.
+      if (data.warning) setWarning(data.warning);
       router.refresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Correction failed");
@@ -125,6 +130,7 @@ export default function CorrectPaymentDialog({
             {loading && <p className="mono text-[11px] text-[var(--ops-muted)] mt-3">Loading…</p>}
             {error && <div className="mt-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-3 py-2">{error}</div>}
             {result && <div className="mt-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl px-3 py-2">{result}</div>}
+            {warning && <div className="mt-2 bg-amber-50 border border-amber-200 text-amber-800 text-xs rounded-xl px-3 py-2">{warning}</div>}
             {loaded && !result && (
               <form onSubmit={submit} className="mt-4 space-y-3">
                 <div className="mono text-[11px] text-[var(--ops-muted)]">
