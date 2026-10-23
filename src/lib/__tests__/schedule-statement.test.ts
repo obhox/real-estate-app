@@ -164,4 +164,21 @@ describe("buildScheduleStatement", () => {
     );
     expect(s.totals.received).toBe(3_937_500);
   });
+
+  it("never writes 'Overdue' when the contract is settled but the plan over-schedules", () => {
+    // Plan asks 1.5m against a 1.0m contract; the client paid the contract in
+    // full. The trailing row is short only on paper and must read Paid.
+    const s = buildScheduleStatement({
+      installments: [inst(0, "INITIAL", "2026-10-14", 600_000), inst(1, "MONTHLY", "2026-11-14", 900_000)],
+      payments: [pay("p1", 1_000_000, "2026-10-14")],
+      now: new Date("2026-12-01"),
+      totalPayable: 1_000_000,
+    });
+    expect(s.fullyPaid).toBe(true);
+    expect(s.totals.outstanding).toBe(0);
+    expect(s.totals.credit).toBe(0);
+    expect(s.nextDue).toBeNull();
+    expect(s.rows.map((r) => r.status)).toEqual(["Paid", "Paid"]);
+    expect(s.rows.some((r) => r.status.includes("Overdue"))).toBe(false);
+  });
 });

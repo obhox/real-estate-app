@@ -12,18 +12,29 @@
 // written to match this replay so they agree; reads derive, they do not trust
 // a stored total. Money is whole-naira Int, never floats.
 
-export type FinanceInstallmentStatus = "Paid" | "Late" | "Partial" | "Pending";
+import { lagosDayKey } from "@/lib/time";
+
+export type FinanceInstallmentStatus = "Paid" | "Late" | "Partial" | "Pending" | "Settled";
 
 // Display status from confirmed money only. Pending (unverified) payments
 // never move an installment off Pending/Late.
+//
+// The contract balance outranks the row: once the transaction is settled, a
+// row left short only because the plan asks for more than the contract is
+// "Settled", never "Late" — a paid-up customer must never read as behind.
+// The due-date test is a Lagos calendar-day compare, the same rule
+// getTransactionFinancials uses, so the row and the balance cannot disagree
+// on a day boundary.
 export function toDisplayStatus(
   confirmedPaid: number,
   scheduledAmount: number,
   dueDate: Date,
-  now: Date = new Date()
+  now: Date = new Date(),
+  opts: { contractSettled?: boolean } = {}
 ): FinanceInstallmentStatus {
   if (confirmedPaid >= scheduledAmount) return "Paid";
-  if (dueDate < now) return "Late";
+  if (opts.contractSettled) return "Settled";
+  if (lagosDayKey(dueDate) < lagosDayKey(now)) return "Late";
   if (confirmedPaid > 0) return "Partial";
   return "Pending";
 }
@@ -134,11 +145,12 @@ export function deriveInstallmentViews(
   installments: AllocationInstallment[],
   payments: AllocationPayment[],
   now: Date,
-  pendingByInstallment: Map<string, number> = new Map()
+  pendingByInstallment: Map<string, number> = new Map(),
+  opts: { contractSettled?: boolean } = {}
 ): { views: InstallmentView[]; credit: number } {
   const { installments: allocated, credit } = replayAllocation(installments, payments);
   const views = allocated.map((a) => {
-    const status = toDisplayStatus(a.confirmedPaid, a.scheduledAmount, a.dueDate, now);
+    const status = toDisplayStatus(a.confirmedPaid, a.scheduledAmount, a.dueDate, now, opts);
     return {
       ...a,
       pendingTotal: pendingByInstallment.get(a.id) ?? 0,

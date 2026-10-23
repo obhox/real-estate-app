@@ -190,6 +190,9 @@ export async function getTransactionSummary(
     if (p.status === "CONFIRMED") confirmedPaid += p.amount;
     else if (p.installmentId) pendingByInst.set(p.installmentId, (pendingByInst.get(p.installmentId) ?? 0) + p.amount);
   }
+  // Balance-first, the same rule getTransactionFinancials applies: once the
+  // contract is covered no row may read Late, whatever the schedule says.
+  const contractSettled = confirmedPaid >= txn.totalPayable;
   // Per-installment paid is the waterfall replay of this transaction's
   // confirmed payments — the same rule the schedule, next-due, overdue lists,
   // receipts and statements read. The Payment.installmentId pointer never
@@ -208,7 +211,8 @@ export async function getTransactionSummary(
       })),
     payments.map((p) => ({ id: p.id, amount: p.amount, paymentDate: new Date(p.paymentDate), status: p.status })),
     now,
-    pendingByInst
+    pendingByInst,
+    { contractSettled }
   );
   const installments = views;
   // Totals, next-due and overdue derive from the shared helper so every

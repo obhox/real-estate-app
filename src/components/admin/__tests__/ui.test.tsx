@@ -13,7 +13,7 @@ describe("StatusBadge mapping", () => {
       "PENDING_VERIFICATION", "pending", "PENDING", "DUE", "PARTIALLY_PAID", "OVERDUE",
       "FAILED", "failed", "CANCELLED", "WAIVED", "DRAFT", "draft",
       "BOOKING_FLOW", "PAYMENT_CONFIRMATION", "ADMIN_MANUAL",
-      "Paid", "Late", "Partial", "Pending",
+      "Paid", "Late", "Partial", "Pending", "Settled",
     ];
     for (const s of known) {
       expect(statusStyle(s), s).toContain("bg-");

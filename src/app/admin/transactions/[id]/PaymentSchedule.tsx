@@ -15,7 +15,7 @@ export type ScheduleInstallment = {
   scheduledAmount: number;
   confirmedPaid: number;
   pendingTotal: number;
-  status: "Paid" | "Late" | "Partial" | "Pending";
+  status: "Paid" | "Late" | "Partial" | "Pending" | "Settled";
   overdue: boolean;
 };
 

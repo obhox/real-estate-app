@@ -133,6 +133,15 @@ describe("finance: installments", () => {
     expect(toDisplayStatus(0, 2_900_000, FUTURE, NOW)).toBe("Pending");
   });
 
+  it("a settled contract turns a short past-due row Settled, never Late", () => {
+    // The plan asks more than the contract; the client paid the contract in
+    // full, so this row is short only on paper. It must never read red.
+    expect(toDisplayStatus(400_000, 900_000, PAST, NOW, { contractSettled: true })).toBe("Settled");
+    expect(toDisplayStatus(400_000, 900_000, PAST, NOW)).toBe("Late");
+    // Due today is not late (calendar-day comparison in Lagos).
+    expect(toDisplayStatus(0, 500_000, NOW, NOW)).toBe("Pending");
+  });
+
   it("overdue queue skips paid and test installments", async () => {
     const overdue = await getOverdueInstallments(fakeDb, NOW);
     expect(overdue.map((r) => r.id)).toEqual([]);
@@ -254,5 +263,37 @@ describe("finance: balance decides the status", () => {
     );
     expect(full.nextInstallment?.number).toBe(2);
     expect(full.isFullyPaid).toBe(false);
+  });
+
+  it("summary rows for a settled over-scheduled plan are never Late (and skip the overdue queue)", async () => {
+    // Plan asks 1.5m against a 1.0m contract; all 1.0m is confirmed. The
+    // trailing row is short on paper only — it reads Settled, not Late.
+    const rows = [
+      { id: "s0", transactionId: "t2", installmentNumber: 0, type: "INITIAL", dueDate: PAST2, scheduledAmount: 600_000, status: "PENDING" },
+      { id: "s1", transactionId: "t2", installmentNumber: 1, type: "MONTHLY", dueDate: PAST2, scheduledAmount: 900_000, status: "PENDING" },
+    ];
+    const receipts = [
+      { id: "sp1", amount: 1_000_000, paymentDate: new Date("2026-09-02T10:00:00Z"), status: "CONFIRMED", installmentId: null, transactionId: "t2" },
+    ];
+    const db = {
+      payment: {
+        aggregate: async () => ({ _sum: { amount: 1_000_000 } }),
+        count: async () => receipts.length,
+        findMany: async (args: { where: Where }) => receipts.filter((p) => matchPayment(p as never, args.where)),
+      },
+      installment: { findMany: async () => rows },
+      transaction: {
+        findMany: async () => [{ id: "t2", totalPayable: 1_000_000 }],
+        findUnique: async () => ({ id: "t2", ref: "TXN-2026-00002", totalPayable: 1_000_000, isTest: false, installments: rows }),
+      },
+    } as unknown as FinanceDb;
+
+    const summary = await getTransactionSummary("t2", db, NOW);
+    expect(summary?.outstanding).toBe(0);
+    expect(summary?.isFullyPaid).toBe(true);
+    expect(summary?.overdueCount).toBe(0);
+    expect(summary?.installments.map((i) => i.status)).toEqual(["Paid", "Settled"]);
+    expect(summary?.installments.some((i) => i.status === "Late")).toBe(false);
+    expect((await getOverdueInstallments(db, NOW)).map((r) => r.id)).toEqual([]);
   });
 });

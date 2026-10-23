@@ -93,7 +93,12 @@ export async function buildScheduleStatementModel(
     paymentDate: new Date(p.paymentDate),
   }));
 
-  const built = buildScheduleStatement({ installments: inst, payments: pay, now: asOfDate });
+  const built = buildScheduleStatement({
+    installments: inst,
+    payments: pay,
+    now: asOfDate,
+    totalPayable: txn.totalPayable,
+  });
 
   const scheduledTotal = inst.reduce((s, i) => s + i.scheduledAmount, 0);
   const dataCheckErrors: string[] = [];

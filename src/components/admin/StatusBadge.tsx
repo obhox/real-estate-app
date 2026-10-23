@@ -57,6 +57,9 @@ export const STATUS_STYLES: Record<string, string> = {
   Late: RED_SOFT,
   Partial: AMBER_SOFT,
   Pending: GRAY_SOFT,
+  // Row is scheduled below what the client paid: the contract is settled, so
+  // this row is never late and never red.
+  Settled: TEAL_SOFT,
   // receipt sources
   BOOKING_FLOW: TEAL_SOFT,
   PAYMENT_CONFIRMATION: TEAL_SOFT,

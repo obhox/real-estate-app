@@ -28,8 +28,8 @@ export type ScheduleStatementRow = {
 export type ScheduleStatementTotals = {
   scheduled: number;
   received: number;
-  outstanding: number; // scheduled - received; negative means credit
-  credit: number; // max(0, received - scheduled)
+  outstanding: number; // contract total - received; negative means credit
+  credit: number; // max(0, received - contract total)
 };
 
 export type ScheduleStatement = {
@@ -45,6 +45,10 @@ export type ScheduleStatementInput = {
   installments: AllocationInstallment[];
   payments: AllocationPayment[];
   now: Date;
+  // The contract balance the plan is measured against. Optional so the pure
+  // builder still works from a schedule alone; when absent the schedule's own
+  // sum stands in. The DB-backed model always passes it.
+  totalPayable?: number;
   formatDate?: (d: Date | string) => string;
   formatMoney?: (n: number) => string;
 };
@@ -116,7 +120,14 @@ export function buildScheduleStatement(input: ScheduleStatementInput): ScheduleS
   }
   const settledAt = settlementDates(ordered, input.payments);
 
-  let scheduledTotal = 0;
+  // Confirmed money actually received, uncapped, and the contract balance it
+  // is measured against. The balance decides completion; the schedule only
+  // describes it.
+  const receivedTotal = orderConfirmedPayments(input.payments).reduce((sum, p) => sum + p.amount, 0);
+  const scheduledTotal = ordered.reduce((sum, i) => sum + i.scheduledAmount, 0);
+  const contractTotal = input.totalPayable ?? scheduledTotal;
+  const contractSettled = receivedTotal >= contractTotal;
+
   const rows: ScheduleStatementRow[] = [];
   for (const inst of ordered) {
     const received = receivedById.get(inst.id) ?? 0;
@@ -129,6 +140,10 @@ export function buildScheduleStatement(input: ScheduleStatementInput): ScheduleS
         settledOnDate && new Date(settledOnDate) < new Date(inst.dueDate)
           ? `Paid early, ${fmtDate(settledOnDate)}`
           : "Paid";
+    } else if (contractSettled) {
+      // Nothing is owed: this row is short only because the plan asks for more
+      // than the contract. A paid-up client must never read "Overdue".
+      status = "Paid";
     } else if (received > 0) {
       status = `Part paid, ${fmtMoney(remaining)} remaining`;
     } else if (new Date(inst.dueDate) < input.now) {
@@ -144,25 +159,26 @@ export function buildScheduleStatement(input: ScheduleStatementInput): ScheduleS
       status,
       settled,
     });
-    scheduledTotal += inst.scheduledAmount;
   }
 
-  // Confirmed money actually received, uncapped: anything beyond the whole
-  // plan is credit, so outstanding can go negative (and is shown as credit).
-  const receivedTotal = orderConfirmedPayments(input.payments).reduce((sum, p) => sum + p.amount, 0);
-  const outstanding = scheduledTotal - receivedTotal;
+  const outstanding = contractTotal - receivedTotal;
   const nextOpen = rows.find((r) => !r.settled) ?? null;
   const openInstallment = nextOpen ? ordered[rows.indexOf(nextOpen)] : null;
 
-  // The plan is complete when every installment is settled (credit, if any,
-  // is money beyond the plan and does not leave an installment open).
-  const fullyPaid = rows.length > 0 && rows.every((r) => r.settled);
+  // The plan is complete when the contract balance is covered (credit, if
+  // any, is money beyond the contract and leaves nothing open).
+  const fullyPaid = rows.length > 0 && contractSettled;
   let settledOn: string | null = null;
   if (fullyPaid) {
     const dates = ordered.map((i) => settledAt.get(i.id)).filter((d): d is Date => !!d);
     if (dates.length > 0) {
       const last = new Date(Math.max(...dates.map((d) => d.getTime())));
       settledOn = fmtDate(last);
+    } else {
+      // Contract covered before any single row filled: date it from the money.
+      const confirmed = orderConfirmedPayments(input.payments);
+      const last = confirmed[confirmed.length - 1];
+      if (last) settledOn = fmtDate(last.paymentDate);
     }
   }
 
@@ -176,7 +192,7 @@ export function buildScheduleStatement(input: ScheduleStatementInput): ScheduleS
       outstanding,
       credit: Math.max(0, -outstanding),
     },
-    nextDue: nextOpen && openInstallment && nextAmount > 0
+    nextDue: !contractSettled && nextOpen && openInstallment && nextAmount > 0
       ? { dueDate: fmtDate(openInstallment.dueDate), label: nextOpen.label, amount: nextAmount }
       : null,
     fullyPaid,
